@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MedMentor</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header>
+    <h1>MedMentor</h1>
+    <nav>
+      <button data-view="dashboard">Dashboard</button>
+      <button data-view="planner">Planner</button>
+      <button data-view="tasks">Tarefas</button>
+      <button data-view="subjects">Matérias</button>
+      <button id="themeToggle">Tema</button>
+    </nav>
+  </header>
+
+  <main>
+    <section id="dashboard" class="view"></section>
+    <section id="planner" class="view hidden"></section>
+    <section id="tasks" class="view hidden"></section>
+    <section id="subjects" class="view hidden"></section>
+  </main>
+
+  <template id="taskTpl">
+    <div class="card task">
+      <div>
+        <h4 class="task-title"></h4>
+        <p class="meta"></p>
+      </div>
+      <div>
+        <select class="task-status">
+          <option value="todo">todo</option>
+          <option value="doing">doing</option>
+          <option value="done">done</option>
+        </select>
+      </div>
+    </div>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
