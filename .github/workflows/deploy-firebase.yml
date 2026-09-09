@@ -1,0 +1,50 @@
+# Publica o site no Firebase Hosting a cada push.
+#
+# Não há build aqui: a pasta publicar/ já vai pronta no repositório, e é ela
+# que o firebase.json manda para o ar. Quem refaz essa pasta é o
+# fonte/montar.sh, que abre um navegador para os testes e por isso não cabe
+# num passo de deploy.
+#
+# O segredo FIREBASE_SERVICE_ACCOUNT fica em Settings › Secrets and variables
+# › Actions, e precisa ser uma conta de serviço com permissão de publicar no
+# Hosting.
+name: Deploy to Firebase Hosting
+
+on:
+  push:
+    branches:
+      - main
+      - claude/seguir-arquivo-prompt-l5s9ed
+  workflow_dispatch:
+
+# Dois pushes seguidos publicavam ao mesmo tempo no canal live, um por cima
+# do outro. Vale o último.
+concurrency:
+  group: firebase-hosting-live
+  cancel-in-progress: true
+
+jobs:
+  build_and_deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Sem o segredo, a ação do Firebase morria com um rastro de pilha do
+      # Node — vermelho, mas ilegível. Ficou assim por catorze publicações
+      # seguidas: o Worker subia, as páginas não, e nada dizia por quê.
+      # Aqui o motivo aparece na primeira linha do log.
+      - name: Conferir se há conta de serviço
+        env:
+          TEM: ${{ secrets.FIREBASE_SERVICE_ACCOUNT != '' }}
+        run: |
+          if [ "$TEM" != "true" ]; then
+            echo "::error::Falta o segredo FIREBASE_SERVICE_ACCOUNT em Settings › Secrets and variables › Actions. As páginas do site NÃO foram publicadas — o que está no ar continua sendo a versão anterior."
+            exit 1
+          fi
+
+      - uses: FirebaseExtended/action-hosting-deploy@v0
+        with:
+          repoToken: '${{ secrets.GITHUB_TOKEN }}'
+          firebaseServiceAccount: '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}'
+          channelId: live
+          projectId: cadencia-7c1f1
