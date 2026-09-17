@@ -1,0 +1,1955 @@
+/* ═══════════════════════════════════════════════════════════════════
+   25 · CARTÕES
+   Cada pessoa escreve os próprios cartões, ligados a uma aula do
+   cronograma. O intervalo até a próxima aparição cresce conforme a
+   resposta, seguindo a ideia do SM-2: acertou fácil, demora mais a
+   voltar; errou, volta hoje mesmo.
+   ═══════════════════════════════════════════════════════════════════ */
+
+const NOTAS = [
+  { id: "errei", rotulo: "Errei", atalho: "1", cor: "var(--bad)", dica: "volta ainda hoje" },
+  { id: "dificil", rotulo: "Difícil", atalho: "2", cor: "var(--warn)", dica: "volta logo" },
+  { id: "bom", rotulo: "Bom", atalho: "3", cor: "var(--neon)", dica: "intervalo normal" },
+  { id: "facil", rotulo: "Fácil", atalho: "4", cor: "var(--ok)", dica: "demora mais a voltar" },
+];
+
+const BARALHO_PADRAO = "Geral";
+const PASTA_SOLTA = "Sem pasta";
+
+/* ── as pastas grandes, uma por área do currículo ─────────────────────
+ *
+ * Cartão gerado por IA (de um documento ou de uma anotação) não vira uma
+ * pasta nova para cada assunto: ele cai na pasta da área a que o material
+ * pertence, e o assunto fica sendo o nome do baralho lá dentro.
+ *
+ * O primeiro nome de cada lista é o que se cria quando a pasta ainda não
+ * existe; os demais são apelidos que a pessoa pode já ter usado, para não
+ * acabar com "PREVENTIVA" e "Medicina Preventiva" lado a lado. A
+ * comparação ignora acento, caixa e pontuação.
+ */
+const PASTAS_DE_AREA = {
+  CL: ["CLÍNICA MÉDICA", "CLINICA", "CLÍNICA", "MEDICINA INTERNA"],
+  CI: ["CIRURGIA", "CIRURGIA GERAL"],
+  GO: ["GO", "GINECOLOGIA E OBSTETRÍCIA", "GINECOLOGIA", "OBSTETRÍCIA", "GO E PREVENTIVA"],
+  PE: ["PEDIATRIA", "PEDIATRIA E NEONATOLOGIA"],
+  PR: ["PREVENTIVA", "MEDICINA PREVENTIVA", "SAÚDE PÚBLICA", "GO E PREVENTIVA"],
+};
+
+const chavePasta = (s) => String(s || "")
+  .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+  .toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim();
+
+/* A pasta onde um baralho daquela área deve entrar: a que a pessoa já tem,
+   se tiver; senão o nome oficial, que será criado. Área desconhecida
+   devolve "", e quem chamou decide o que fazer. */
+function pastaDaArea(pastas, area) {
+  const nomes = PASTAS_DE_AREA[String(area || "").toUpperCase()];
+  if (!nomes) return "";
+  const jaTem = new Map((pastas || []).map((n) => [chavePasta(n), n]));
+  for (const n of nomes) {
+    const achada = jaTem.get(chavePasta(n));
+    if (achada) return achada;
+  }
+  return nomes[0];
+}
+
+/* ── ajustes de cada baralho ──────────────────────────────────────────
+ *
+ * Ficam em data.baralhoCfg, com a pasta na chave: dois baralhos de mesmo
+ * nome em pastas diferentes são baralhos diferentes.
+ */
+const CFG_PADRAO = { embaralhar: true, min: 0, max: 0 };
+const chaveBaralho = (pasta, baralho) =>
+  `${pasta || PASTA_SOLTA}|${baralho || BARALHO_PADRAO}`;
+const lerCfg = (cfgs, chave) => ({ ...CFG_PADRAO, ...((cfgs || {})[chave] || {}) });
+
+/* Embaralhar de verdade (Fisher-Yates). Um sort com Math.random() parece
+   fazer isso, mas distribui torto e ainda depende do algoritmo do
+   navegador. */
+function baralhar(lista) {
+  const a = lista.slice();
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+/* A fila de um baralho, já com os ajustes dele aplicados.
+ *
+ * O mínimo adianta os cartões que vencem mais cedo, para um dia fraco não
+ * ficar curto demais; eles entram no fim, depois dos que já venceram. O
+ * máximo corta o excesso, para um dia pesado não virar desistência. */
+function filaDoBaralho(lista, hoje, cfg) {
+  const vencidos = lista.filter((c) => (c.prox || hoje) <= hoje);
+  let fila = cfg.embaralhar ? baralhar(vencidos) : vencidos.slice();
+
+  if (cfg.min > 0 && fila.length < cfg.min) {
+    const adiantar = lista
+      .filter((c) => (c.prox || hoje) > hoje)
+      .sort((a, b) => String(a.prox || "").localeCompare(String(b.prox || "")))
+      .slice(0, cfg.min - fila.length);
+    fila = fila.concat(cfg.embaralhar ? baralhar(adiantar) : adiantar);
+  }
+  if (cfg.max > 0 && fila.length > cfg.max) fila = fila.slice(0, cfg.max);
+  return fila;
+}
+
+/* Renomear ou mover um baralho muda a chave dele. Sem levar o ajuste junto,
+   o embaralhar e os limites voltariam ao padrão calados, e a pessoa só
+   perceberia dias depois, estudando demais ou de menos. */
+function moverCfg(cfgs, mudar) {
+  const fora = {};
+  for (const [k, v] of Object.entries(cfgs || {})) {
+    const [pasta, baralho] = k.split("|");
+    const novo = mudar(pasta, baralho);
+    fora[novo ? chaveBaralho(novo.pasta, novo.baralho) : k] = v;
+  }
+  return fora;
+}
+
+/* Estudando mais de um baralho de uma vez, cada um entra com os próprios
+   ajustes, um depois do outro. Misturar tudo num embaralhamento só
+   desrespeitaria quem desligou o embaralhar no baralho dele. */
+function filaDeVarios(cartoes, hoje, cfgs) {
+  const grupos = new Map();
+  for (const c of cartoes) {
+    const k = chaveBaralho(c.pasta, c.baralho);
+    if (!grupos.has(k)) grupos.set(k, []);
+    grupos.get(k).push(c);
+  }
+  const fora = [];
+  for (const [k, lista] of grupos) {
+    for (const c of filaDoBaralho(lista, hoje, lerCfg(cfgs, k))) fora.push(c);
+  }
+  return fora;
+}
+
+/* Os baralhos moram em pastas. A pasta é um rótulo guardado no cartão, o que
+   evita uma estrutura paralela que poderia sair de sincronia. A lista em
+   data.pastas existe só para as pastas vazias não sumirem ao recarregar:
+   uma pasta recém-criada ainda não tem cartão nenhum apontando para ela. */
+function agruparEmPastas(cartoes, hoje, avulsas) {
+  const pastas = new Map();
+  const garantir = (nome) => {
+    if (!pastas.has(nome)) pastas.set(nome, { nome, baralhos: new Map(), total: 0, hoje: 0 });
+    return pastas.get(nome);
+  };
+  for (const c of cartoes) {
+    const P = garantir(c.pasta || PASTA_SOLTA);
+    const b = c.baralho || BARALHO_PADRAO;
+    if (!P.baralhos.has(b)) P.baralhos.set(b, { nome: b, total: 0, hoje: 0 });
+    const B = P.baralhos.get(b);
+    const venceu = (c.prox || hoje) <= hoje;
+    B.total += 1; P.total += 1;
+    if (venceu) { B.hoje += 1; P.hoje += 1; }
+  }
+  for (const nome of (avulsas || [])) garantir(nome);
+  return [...pastas.values()]
+    .map((p) => ({ ...p, baralhos: [...p.baralhos.values()].sort((a, b) => b.hoje - a.hoje || a.nome.localeCompare(b.nome)) }))
+    .sort((a, b) => (a.nome === PASTA_SOLTA ? 1 : b.nome === PASTA_SOLTA ? -1 : b.hoje - a.hoje || a.nome.localeCompare(b.nome)));
+}
+
+/* ── baralhos publicados ──────────────────────────────────────────────
+ *
+ * O dono publica um baralho dele; quem assina copia para a própria conta.
+ * É cópia, não pasta compartilhada, e de propósito: duas pessoas estudando
+ * o mesmo cartão têm intervalos de revisão diferentes.
+ *
+ * A senha do assunto é o servidor: publicar é só do dono, baixar é só de
+ * quem tem plano em dia, e a rota confere as duas coisas. Aqui é só a tela.
+ */
+const ROTA_BARALHOS = "/api/baralhos";
+
+async function falarComBaralhos(nuvem, corpo) {
+  let token = "";
+  try {
+    if (nuvem && nuvem.sdk && nuvem.sdk.auth && nuvem.sdk.auth.currentUser) {
+      token = await nuvem.sdk.auth.currentUser.getIdToken();
+    }
+  } catch (e) { /* segue sem token, o servidor recusa */ }
+  if (!token) return { erro: "Entre na sua conta para ver os baralhos publicados." };
+  const { dados, erro } = await chamarApi(ROTA_BARALHOS, { ...corpo, token }, "Os baralhos publicados");
+  return erro ? { erro } : dados;
+}
+
+function Publicados({ nuvem, souDono, setData, notify, publicados, recarregar }) {
+  const [ocupado, setOcupado] = useState("");
+  const [erro, setErro] = useState("");
+
+  const baixar = async (b) => {
+    setOcupado(b.slug); setErro("");
+    const j = await falarComBaralhos(refNuvem.current, { acao: "baixar", slug: b.slug });
+    setOcupado("");
+    if (j.erro) { setErro(j.erro); return; }
+
+    const pasta = (j.pasta || PASTA_SOLTA).slice(0, 40);
+    const nome = (j.nome || BARALHO_PADRAO).slice(0, 40);
+    /* Vindo uma pasta, cada cartão traz o baralho dele e a divisão é
+       recriada; vindo um baralho só, todos entram nele. */
+    const novos = (j.cartoes || []).map((c) => novoCartao(
+      c.frente, c.verso, c.subjectId,
+      j.tipo === "pasta" ? (c.baralho || BARALHO_PADRAO) : nome,
+      pasta));
+    if (!novos.length) { setErro("Isso veio vazio."); return; }
+
+    setData((p) => ({
+      ...p,
+      flash: [...novos, ...(p.flash || [])],
+      pastas: registrarPasta(p.pastas, pasta),
+    }));
+    notify(`${novos.length} cartõe${novos.length === 1 ? "" : "s"} copiado${novos.length === 1 ? "" : "s"} para "${j.tipo === "pasta" ? pasta : nome}".`);
+  };
+
+  const despublicar = async (b) => {
+    setOcupado(b.slug); setErro("");
+    const j = await falarComBaralhos(refNuvem.current, { acao: "despublicar", slug: b.slug });
+    setOcupado("");
+    if (j.erro) { setErro(j.erro); return; }
+    notify(j.mensagem || "Baralho tirado do ar.");
+    recarregar();
+  };
+
+  if (!publicados) return null;
+  if (publicados.precisaPlano) {
+    return (
+      <Card className="px-6 py-5" flat>
+        <Mini style={{ lineHeight: 1.7 }}>
+          Baralhos prontos, montados por quem cuida do site, fazem parte do
+          plano completo.
+        </Mini>
+      </Card>
+    );
+  }
+  if (!publicados.lista.length) return null;
+
+  return (
+    <Card className="px-6 py-6" brilho="var(--ok)">
+      <div className="flex items-center justify-between gap-3 flex-wrap">
+        <H size={18} color="var(--ok)" icon={<Download size={16} />}>Baralhos prontos</H>
+        <Btn size="sm" tone="outline" onClick={recarregar}><RefreshCw size={13} /> atualizar</Btn>
+      </div>
+      <Texto style={{ marginTop: 10 }}>
+        Copie para a sua conta e eles viram seus: o agendamento das revisões
+        passa a ser o seu, e mexer neles não muda nada para mais ninguém.
+      </Texto>
+
+      <div className="mt-5 flex flex-col gap-2">
+        {publicados.lista.map((b) => (
+          <div key={b.slug} className="flex items-center gap-3 rounded-2xl px-4 py-3 flex-wrap"
+            style={{ background: T.card2 }}>
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+                <span style={{ fontSize: 14.5, fontWeight: 600, color: T.ink }}>{b.nome}</span>
+                {b.tipo === "pasta" ? (
+                  <span style={{
+                    fontSize: 11, fontWeight: 700, color: "var(--neon2)",
+                    background: soft("var(--neon2)", 16), padding: "2px 8px", borderRadius: 99,
+                  }}>pasta</span>
+                ) : null}
+              </div>
+              <Mini style={{ marginTop: 2 }}>
+                {b.tipo !== "pasta" && b.pasta && b.pasta !== PASTA_SOLTA ? `${b.pasta} · ` : ""}
+                {b.total} cartõe{b.total === 1 ? "" : "s"}
+                {b.tipo === "pasta" && b.baralhos ? ` em ${b.baralhos} baralho${b.baralhos === 1 ? "" : "s"}` : ""}
+              </Mini>
+            </div>
+            <Btn size="sm" tone="primary" disabled={!!ocupado} onClick={() => baixar(b)}>
+              {ocupado === b.slug ? "…" : "copiar"}
+            </Btn>
+            {souDono ? (
+              <Btn size="sm" tone="danger" disabled={!!ocupado} onClick={() => despublicar(b)}>
+                tirar do ar
+              </Btn>
+            ) : null}
+          </div>
+        ))}
+      </div>
+      {erro ? <Label style={{ marginTop: 12, color: T.bad, textTransform: "none", letterSpacing: 0, fontSize: 14 }}>{erro}</Label> : null}
+    </Card>
+  );
+}
+
+/* Enquanto o estudo está aberto, as teclas de 1 a 4 respondem o cartão.
+   Sem esta trava elas também trocariam de aba, porque o app usa números
+   como atalho de navegação. */
+let estudandoCartoes = false;
+const estaEstudando = () => estudandoCartoes;
+
+function novoCartao(frente, verso, subjectId, baralho, pasta) {
+  return {
+    id: uid(),
+    frente: String(frente).slice(0, 400),
+    verso: String(verso).slice(0, 800),
+    subjectId: subjectId || null,
+    baralho: (baralho || BARALHO_PADRAO).slice(0, 40),
+    pasta: (pasta || PASTA_SOLTA).slice(0, 40),
+    criado: todayISO(),
+    prox: todayISO(),      // nasce para ser estudado hoje
+    inter: 0,              // dias até a próxima vez
+    facilidade: 2.5,       // quanto o intervalo cresce a cada acerto
+    revisoes: 0,
+    lapsos: 0,
+  };
+}
+
+/* Devolve o cartão atualizado depois de uma resposta. */
+function reagendar(c, nota) {
+  const n = { ...c, revisoes: (c.revisoes || 0) + 1 };
+  let f = Number(c.facilidade) || 2.5;
+  let inter = Number(c.inter) || 0;
+
+  if (nota === "errei") {
+    n.lapsos = (c.lapsos || 0) + 1;
+    f = Math.max(1.3, f - 0.2);
+    inter = 0;                       // volta na mesma sessão
+  } else if (nota === "dificil") {
+    f = Math.max(1.3, f - 0.15);
+    inter = inter === 0 ? 1 : Math.max(1, Math.round(inter * 1.2));
+  } else if (nota === "bom") {
+    inter = inter === 0 ? 1 : inter === 1 ? 3 : Math.round(inter * f);
+  } else {
+    f = Math.min(3.2, f + 0.15);
+    inter = inter === 0 ? 2 : inter === 1 ? 5 : Math.round(inter * f * 1.3);
+  }
+
+  inter = Math.min(365, inter);
+  n.facilidade = Math.round(f * 100) / 100;
+  n.inter = inter;
+  n.prox = addDays(todayISO(), inter);
+  return n;
+}
+
+/* Lê o texto de uma exportação e devolve os cartões.
+   Aceita tabulação, ponto e vírgula ou vírgula como separador, que é o
+   que sai do Anki, do Quizlet e de uma planilha. */
+function lerImportacao(texto, baralhoPadrao) {
+  const linhas = String(texto).split(/\r?\n/);
+  const fora = [];
+  let separador = "\t";
+  const amostra = linhas.filter((l) => l.trim() && l[0] !== "#").slice(0, 12).join("\n");
+  if (!amostra.includes("\t")) {
+    const pv = (amostra.match(/;/g) || []).length;
+    const vg = (amostra.match(/,/g) || []).length;
+    separador = pv >= vg && pv > 0 ? ";" : ",";
+  }
+
+  const partir = (linha) => {
+    /* respeita aspas, para uma resposta com vírgula não virar duas colunas */
+    const col = [];
+    let atual = "", dentro = false;
+    for (let i = 0; i < linha.length; i++) {
+      const c = linha[i];
+      if (c === '"') {
+        if (dentro && linha[i + 1] === '"') { atual += '"'; i += 1; }
+        else dentro = !dentro;
+      } else if (c === separador && !dentro) { col.push(atual); atual = ""; }
+      else atual += c;
+    }
+    col.push(atual);
+    return col;
+  };
+
+  const limpar = (s) => String(s || "")
+    .replace(/<br\s*\/?>/gi, "\n")
+    .replace(/<[^>]+>/g, "")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .trim();
+
+  for (const linha of linhas) {
+    const cru = linha.trim();
+    if (!cru || cru[0] === "#") continue;          // o Anki começa com comentários
+    const col = partir(linha).map(limpar);
+    const frente = col[0], verso = col[1];
+    if (!frente || !verso) continue;
+    if (/^(frente|front|pergunta|question|term)$/i.test(frente)) continue;   // cabeçalho
+    const baralho = col[2] && col[2].length < 40 ? col[2] : baralhoPadrao;
+    fora.push(novoCartao(frente, verso, null, baralho));
+  }
+  return fora;
+}
+
+const estagio = (c) => (
+  (c.inter || 0) === 0 ? "novo" : (c.inter || 0) < 21 ? "aprendendo" : "firme"
+);
+
+/* Guarda o nome da pasta na lista salva, sem repetir e sem a solta, que é
+   só o rótulo de quem não está em pasta nenhuma. */
+function registrarPasta(lista, nome) {
+  if (!nome || nome === PASTA_SOLTA) return lista || [];
+  return [...new Set([...(lista || []), nome])].slice(0, 60);
+}
+
+/* ── montar flashcards a partir de PDF ou Word ────────────────────────
+ *
+ * Fica aqui, e não numa aba à parte, porque o resultado é cartão: entra em
+ * data.flash igualzinho ao que se escreve à mão ou ao que vem do Anki.
+ *
+ * O leitor de PDF e o de Word só chegam ao navegador quando alguém usa esta
+ * função, do jeito que o leitor de banco do Anki já funciona logo abaixo —
+ * e reaproveita o mesmo depósito de imagens (IndexedDB) e o mesmo formato
+ * de marcador, [[img:nome]], que o cartão já sabe desenhar.
+ *
+ * O texto vai para a IA; as imagens não. A IA só decide ONDE, no texto que
+ * ela já recebeu, um marcador existente merece entrar num cartão — ela não
+ * enxerga a imagem em si, só o marcador que aponta pra ela.
+ */
+/* A partir da versão 4, o pdfjs-dist passou a publicar só como módulo ES
+   (build/pdf.mjs) — sem o build clássico que expõe window.pdfjsLib ao
+   carregar por <script>, do jeito que baixarScript() carrega. A 3.11.174 é
+   a última da série 3.x, e essa ainda tem. Se um dia for preciso subir de
+   versão, troque para o jeito de import() de módulo, não só o número aqui. */
+const PDF_JS_VERSAO = "3.11.174";
+const PDF_JS_CDN = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDF_JS_VERSAO}/pdf.min.js`;
+const PDF_WORKER_CDN = `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${PDF_JS_VERSAO}/pdf.worker.min.js`;
+const MAMMOTH_CDN = "https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.7.0/mammoth.browser.min.js";
+
+let pdfJsPromessa = null;
+function carregarPdfJs() {
+  if (pdfJsPromessa) return pdfJsPromessa;
+  pdfJsPromessa = (async () => {
+    if (!window.pdfjsLib) {
+      try { await baixarScript(PDF_JS_CDN); }
+      catch (e) { throw new Error("Não consegui carregar o leitor de PDF. Confira sua conexão."); }
+    }
+    if (!window.pdfjsLib) throw new Error("O leitor de PDF não iniciou.");
+    window.pdfjsLib.GlobalWorkerOptions.workerSrc = PDF_WORKER_CDN;
+    return window.pdfjsLib;
+  })();
+  return pdfJsPromessa;
+}
+
+let mammothPromessa = null;
+function carregarMammoth() {
+  if (mammothPromessa) return mammothPromessa;
+  mammothPromessa = (async () => {
+    if (!window.mammoth) {
+      try { await baixarScript(MAMMOTH_CDN); }
+      catch (e) { throw new Error("Não consegui carregar o leitor de Word. Confira sua conexão."); }
+    }
+    if (!window.mammoth) throw new Error("O leitor de Word não iniciou.");
+    return window.mammoth;
+  })();
+  return mammothPromessa;
+}
+
+/* Prefixo único por importação, para as imagens de um arquivo não colidirem
+   com as de outro já guardado. */
+const prefixoImagem = () => `doc-${Date.now().toString(36)}-${Math.floor(Math.random() * 46656).toString(36)}`;
+
+const LIMITE_PAGINAS_PDF = 60;
+const LIMITE_IMAGENS_DOC = 20;
+/* Figura menor que isso, já na escala em que a página foi desenhada, é
+   decoração — um filete, um marcador de lista, um ícone de rodapé —, não a
+   foto ou o esquema que vale virar cartão. */
+const FIGURA_MIN_PX = 40;
+
+const aplicarMatriz = (m, x, y) => [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+
+/* Compõe uma matriz do PDF [a b c d e f] com a CTM atual — a mesma conta que
+   o operador "cm" faz. Usada tanto para o cm de verdade quanto para o
+   começo de um Form XObject, que também carrega uma matriz própria. */
+const combinarMatriz = ([a, b, c, d, e, f], ctm) => [
+  a * ctm[0] + b * ctm[2], a * ctm[1] + b * ctm[3],
+  c * ctm[0] + d * ctm[2], c * ctm[1] + d * ctm[3],
+  e * ctm[0] + f * ctm[2] + ctm[4], e * ctm[1] + f * ctm[3] + ctm[5],
+];
+
+/* Cada figura embutida no PDF é desenhada com uma matriz (o operador "cm")
+   que mapeia o quadrado unitário [0,1]x[0,1] — o espaço da própria imagem —
+   para o retângulo da página onde ela aparece. Percorrendo a lista de
+   operadores do jeito que o page.render também percorre (acompanhando
+   save/restore/transform, e o Form XObject, que empilha a matriz própria
+   dele do mesmo jeito que um save/transform), dá para calcular exatamente
+   esse retângulo em pixels do canvas, sem precisar decodificar o formato de
+   cada imagem por dentro — o que muda de PDF para PDF e falha de um jeito
+   diferente a cada gerador. */
+async function retangulosDeImagem(pdfjsLib, page, viewport) {
+  const OPS = pdfjsLib.OPS;
+  const opList = await page.getOperatorList();
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const pilha = [];
+  const caixas = [];
+
+  for (let i = 0; i < opList.fnArray.length; i++) {
+    const fn = opList.fnArray[i], args = opList.argsArray[i];
+    if (fn === OPS.save || fn === OPS.paintFormXObjectBegin) {
+      pilha.push(ctm);
+      const matriz = fn === OPS.paintFormXObjectBegin && args && args[0];
+      if (Array.isArray(matriz) && matriz.length === 6) ctm = combinarMatriz(matriz, ctm);
+    } else if (fn === OPS.restore || fn === OPS.paintFormXObjectEnd) {
+      ctm = pilha.pop() || [1, 0, 0, 1, 0, 0];
+    } else if (fn === OPS.transform) {
+      ctm = combinarMatriz(args, ctm);
+    } else if (fn === OPS.paintImageXObject || fn === OPS.paintJpegXObject || fn === OPS.paintInlineImageXObject) {
+      const cantos = [[0, 0], [1, 0], [0, 1], [1, 1]]
+        .map(([x, y]) => aplicarMatriz(ctm, x, y))
+        .map(([x, y]) => aplicarMatriz(viewport.transform, x, y));
+      const xs = cantos.map((p) => p[0]), ys = cantos.map((p) => p[1]);
+      const x = Math.min(...xs), y = Math.min(...ys);
+      const w = Math.max(...xs) - x, h = Math.max(...ys) - y;
+      if (w >= FIGURA_MIN_PX && h >= FIGURA_MIN_PX) caixas.push({ x, y, w, h });
+    }
+  }
+  return caixas;
+}
+
+/* Recorta só as figuras da página — não a página inteira. Desenha a página
+   uma vez só, numa resolução alta o bastante para o recorte não sair
+   borrado (o recorte é menor que a página, então precisa de mais pixels por
+   ponto do que bastaria para a página toda), e tira cada retângulo dali. */
+async function figurasDaPagina(pdfjsLib, page) {
+  const vp1 = page.getViewport({ scale: 1 });
+  const escala = Math.min(3, Math.max(1, 1900 / Math.max(vp1.width, vp1.height)));
+  const viewport = page.getViewport({ scale: escala });
+
+  const caixas = await retangulosDeImagem(pdfjsLib, page, viewport);
+  if (caixas.length === 0) return [];
+
+  const paginaCanvas = document.createElement("canvas");
+  paginaCanvas.width = Math.ceil(viewport.width);
+  paginaCanvas.height = Math.ceil(viewport.height);
+  await page.render({ canvasContext: paginaCanvas.getContext("2d"), viewport }).promise;
+
+  return caixas.map(({ x, y, w, h }) => {
+    const sx = Math.max(0, Math.min(paginaCanvas.width - 1, x));
+    const sy = Math.max(0, Math.min(paginaCanvas.height - 1, y));
+    const sw = Math.max(1, Math.min(paginaCanvas.width - sx, w));
+    const sh = Math.max(1, Math.min(paginaCanvas.height - sy, h));
+    /* o lado maior do recorte tem um teto, para uma figura ocupando a
+       página quase inteira não virar um arquivo enorme à toa */
+    const fator = Math.min(1, 1400 / Math.max(sw, sh));
+    const alvo = document.createElement("canvas");
+    alvo.width = Math.max(1, Math.round(sw * fator));
+    alvo.height = Math.max(1, Math.round(sh * fator));
+    alvo.getContext("2d").drawImage(paginaCanvas, sx, sy, sw, sh, 0, 0, alvo.width, alvo.height);
+    return alvo.toDataURL("image/jpeg", 0.86);
+  });
+}
+
+async function lerPdfParaTexto(arquivo, aviso) {
+  aviso("carregando o leitor de PDF");
+  const pdfjsLib = await carregarPdfJs();
+  aviso("abrindo o arquivo");
+  const bytes = new Uint8Array(await arquivo.arrayBuffer());
+  const doc = await pdfjsLib.getDocument({ data: bytes }).promise;
+
+  const prefixo = prefixoImagem();
+  const totalPaginas = Math.min(doc.numPages, LIMITE_PAGINAS_PDF);
+  const blocos = [];
+  let imagens = 0;
+
+  for (let n = 1; n <= totalPaginas; n++) {
+    aviso(`lendo página ${n} de ${totalPaginas}`);
+    const page = await doc.getPage(n);
+    const conteudo = await page.getTextContent();
+    const texto = conteudo.items.map((it) => it.str || "").join(" ").replace(/\s+/g, " ").trim();
+
+    let marcadores = "";
+    if (imagens < LIMITE_IMAGENS_DOC) {
+      try {
+        const figuras = await figurasDaPagina(pdfjsLib, page);
+        for (const dataUri of figuras) {
+          if (imagens >= LIMITE_IMAGENS_DOC) break;
+          const nome = `${prefixo}-${n}-${imagens + 1}.jpg`;
+          await guardarMidia(nome, dataUri);
+          imagens += 1;
+          marcadores += ` [[img:${nome}]]`;
+        }
+      } catch (e) { /* essa página não deu para recortar figura, segue só com o texto */ }
+    }
+
+    if (texto || marcadores) blocos.push(`--- página ${n} ---\n${texto}${marcadores}`);
+  }
+  if (doc.numPages > totalPaginas) {
+    blocos.push(`[o documento tem ${doc.numPages} páginas; só as ${totalPaginas} primeiras foram lidas]`);
+  }
+  return { texto: blocos.join("\n\n"), imagens };
+}
+
+/* Mesma ideia de limparCampo, um pouco acima, mas para imagens que chegam
+   como data URI (do Word) em vez de nome de arquivo (do Anki). */
+function limparHtmlComImagens(html, prefixo) {
+  let s = String(html || "");
+  const imagens = [];
+  let cont = 0;
+  s = s.replace(/<img[^>]*src\s*=\s*"(data:[^"]+)"[^>]*>/gi, (m, uri) => {
+    cont += 1;
+    const tipo = /^data:image\/(png|jpe?g|gif|webp)/i.exec(uri);
+    const ext = tipo ? tipo[1].replace("jpeg", "jpg") : "png";
+    const nome = `${prefixo}-${cont}.${ext}`;
+    imagens.push({ nome, dataUri: uri });
+    return ` [[img:${nome}]] `;
+  });
+  s = s.replace(/<\/(p|h[1-6]|li|tr|div)>/gi, "\n");
+  s = s.replace(/<br\s*\/?>/gi, "\n");
+  s = s.replace(/<[^>]+>/g, "");
+  s = s.replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+  s = s.replace(/\n{3,}/g, "\n\n").trim();
+  return { texto: s, imagens };
+}
+
+async function lerDocxParaTexto(arquivo, aviso) {
+  aviso("carregando o leitor de Word");
+  const mammoth = await carregarMammoth();
+  aviso("lendo o arquivo");
+  const arrayBuffer = await arquivo.arrayBuffer();
+  const r = await mammoth.convertToHtml({ arrayBuffer });
+  const { texto, imagens } = limparHtmlComImagens(r.value, prefixoImagem());
+
+  let salvas = 0;
+  for (const { nome, dataUri } of imagens.slice(0, LIMITE_IMAGENS_DOC)) {
+    if (dataUri.length > 6 * 1024 * 1024) continue;   // imagem grande demais, pula
+    try { await guardarMidia(nome, dataUri); salvas += 1; } catch (e) { /* segue sem essa imagem */ }
+  }
+  return { texto, imagens: salvas };
+}
+
+const ROTA_FLASHCARDS_IA = "/api/flashcards-ia";
+
+async function gerarFlashcardsComIA({ texto, baralho, cobrirTudo, nuvem }) {
+  let token = "";
+  try {
+    if (nuvem && nuvem.sdk && nuvem.sdk.auth && nuvem.sdk.auth.currentUser) {
+      token = await nuvem.sdk.auth.currentUser.getIdToken();
+    }
+  } catch (e) { /* o servidor decide sem token */ }
+  return chamarApi(ROTA_FLASHCARDS_IA, { token, texto, baralho, cobrirTudo: !!cobrirTudo }, "O montador de flashcards");
+}
+
+function MontarFlashcardsIA({ setData, notify, nuvem, pastas }) {
+  const [nomeBaralho, setNomeBaralho] = useState("");
+  const [cobrirTudo, setCobrirTudo] = useState(false);
+  const [lendo, setLendo] = useState("");
+  const [erro, setErro] = useState("");
+  const arquivoRef = useRef(null);
+
+  const processar = async (f) => {
+    setErro("");
+    if (!/\.(pdf|docx)$/i.test(f.name)) {
+      setErro("Envie um PDF ou um Word (.docx). O .doc antigo não abre no navegador. Salve como .docx e tente de novo.");
+      return;
+    }
+    const baralho = (nomeBaralho || f.name.replace(/\.[^.]+$/, "")).trim().slice(0, 40) || "Assunto importado";
+    try {
+      setLendo("lendo o arquivo");
+      const extraido = /\.pdf$/i.test(f.name)
+        ? await lerPdfParaTexto(f, setLendo)
+        : await lerDocxParaTexto(f, setLendo);
+
+      if (!extraido.texto.trim()) {
+        setErro("Não encontrei texto nesse arquivo. Se for um PDF escaneado (só imagem, sem texto por trás), ele não dá para ler assim.");
+        return;
+      }
+
+      setLendo(cobrirTudo ? "a IA está montando todos os cartões (pode demorar um pouco)" : "a IA está organizando os cartões");
+      const { dados, erro: falha } = await gerarFlashcardsComIA({ texto: extraido.texto, baralho, cobrirTudo, nuvem });
+      if (falha) { setErro(falha); return; }
+      if (!dados || !Array.isArray(dados.cartoes) || dados.cartoes.length === 0) {
+        setErro("A IA não conseguiu montar cartões a partir desse conteúdo.");
+        return;
+      }
+
+      const nomeFinal = (dados.baralho || baralho).slice(0, 40);
+      /* A IA também diz de que área é o material, e o baralho entra na
+         pasta grande dessa área. Quando ela não soube dizer, vale o de
+         antes: uma pasta com o nome do próprio assunto. */
+      const pastaFinal = pastaDaArea(pastas, dados.area) || nomeFinal;
+      const novos = dados.cartoes.map((c) => novoCartao(c.frente, c.verso, null, nomeFinal, pastaFinal));
+      setData((p) => ({
+        ...p,
+        flash: [...novos, ...(p.flash || [])],
+        pastas: registrarPasta(p.pastas, pastaFinal),
+      }));
+
+      const comImg = extraido.imagens || 0;
+      notify(`${novos.length} cartõe${novos.length === 1 ? "" : "s"} montados em "${nomeFinal}"`
+        + (pastaFinal === nomeFinal ? "" : `, na pasta ${pastaFinal}`)
+        + (comImg ? `, com ${comImg} imagem${comImg === 1 ? "" : "ns"} guardada${comImg === 1 ? "" : "s"}` : "")
+        + (dados.cortado ? ". O material era grande e foi cortado antes do fim." : "."));
+      setNomeBaralho("");
+    } catch (e) {
+      setErro((e && e.message) || "Não consegui processar esse arquivo.");
+    } finally { setLendo(""); }
+  };
+
+  /* O botão nunca quebra linha por dentro (é assim que Btn é desenhado, de
+     propósito, para rótulo curto de botão), então um texto de status
+     comprido — "a IA está montando todos os cartões (pode demorar um
+     pouco)" — estourava a largura no celular. O rótulo do botão fica curto
+     sempre; o status detalhado vai numa linha à parte, que quebra normal. */
+  return (
+    <div className="flex flex-col gap-3">
+      <div className="flex items-center gap-2 flex-wrap">
+        <Btn tone="primary" size="sm" disabled={!!lendo}
+          onClick={() => arquivoRef.current && arquivoRef.current.click()}>
+          <Upload size={14} /> {lendo ? "Um momento…" : "Jogue seu documento aqui"}
+        </Btn>
+        <input ref={arquivoRef} type="file" accept=".pdf,.docx"
+          onChange={(e) => {
+            const f = e.target.files && e.target.files[0];
+            e.target.value = "";
+            if (f) processar(f);
+          }}
+          style={{ display: "none" }} disabled={!!lendo} />
+        <TextInput value={nomeBaralho} placeholder="nome do baralho (opcional)" disabled={!!lendo}
+          onChange={(e) => setNomeBaralho(e.target.value)}
+          style={{ padding: "6px 10px", fontSize: 13, maxWidth: 220 }} />
+      </div>
+
+      {lendo ? (
+        <Mini style={{ lineHeight: 1.6 }}>{lendo}…</Mini>
+      ) : (
+        <label className="flex items-center gap-2.5" style={{ cursor: "pointer" }}>
+          <input type="checkbox" checked={cobrirTudo}
+            onChange={(e) => setCobrirTudo(e.target.checked)} />
+          <span style={{ fontSize: 13.5, color: T.dim }}>
+            Quero todos os cartões possíveis, cobrindo tudo do documento
+            <span style={{ color: T.faint }}> · sem marcar, a IA escolhe só os pontos principais</span>
+          </span>
+        </label>
+      )}
+
+      <Mini style={{ maxWidth: 480, lineHeight: 1.6 }}>
+        Funciona melhor com PDF que tem texto de verdade (não uma foto escaneada)
+        ou um Word exportado do próprio material. As imagens do documento entram
+        junto, nos cartões que precisarem delas.
+      </Mini>
+      {erro ? <Label style={{ color: T.bad, textTransform: "none", letterSpacing: 0, fontSize: 14, lineHeight: 1.6 }}>{erro}</Label> : null}
+    </div>
+  );
+}
+
+/* ── o visual do cartão ────────────────────────────────────────────────
+ *
+ * Quem estuda por flashcard passa horas olhando para esta tela, e o que
+ * serve para uma pessoa atrapalha outra: tem quem precise de letra grande,
+ * quem leia melhor em serifada, quem ache o fundo liso sem graça e quem
+ * ache qualquer arte no fundo uma distração.
+ *
+ * Tudo aqui é CSS: nenhuma imagem, nenhum arquivo para baixar. O cartão já
+ * abre sem internet, e uma arte de fundo em PNG desfaria isso. As artes
+ * usam as cores do tema, então trocar a cor do site leva o cartão junto, e
+ * funcionam no claro e no escuro sem uma segunda versão.
+ */
+const FUNDOS_CARTAO = [
+  { id: "limpo", nome: "Limpo", arte: () => ({}) },
+  {
+    id: "aurora",
+    nome: "Aurora",
+    arte: () => ({
+      backgroundImage:
+        `radial-gradient(70% 55% at 18% 0%, ${soft("var(--neon)", 16)} 0%, transparent 70%),`
+        + `radial-gradient(60% 50% at 92% 12%, ${soft("var(--neon2)", 18)} 0%, transparent 72%)`,
+    }),
+  },
+  {
+    id: "grade",
+    nome: "Grade",
+    arte: () => ({
+      backgroundImage:
+        `linear-gradient(${soft("var(--line2)", 55)} 1px, transparent 1px),`
+        + `linear-gradient(90deg, ${soft("var(--line2)", 55)} 1px, transparent 1px)`,
+      backgroundSize: "34px 34px, 34px 34px",
+    }),
+  },
+  {
+    id: "vinheta",
+    nome: "Vinheta",
+    arte: () => ({
+      backgroundImage: `radial-gradient(120% 85% at 50% 42%, transparent 45%, ${soft("var(--bg)", 70)} 100%)`,
+    }),
+  },
+  {
+    id: "fita",
+    nome: "Fita",
+    arte: () => ({
+      backgroundImage:
+        `repeating-linear-gradient(135deg, ${soft("var(--neon)", 7)} 0 12px, transparent 12px 30px)`,
+    }),
+  },
+  {
+    id: "pontos",
+    nome: "Pontilhado",
+    arte: () => ({
+      backgroundImage: `radial-gradient(${soft("var(--line2)", 75)} 1px, transparent 1px)`,
+      backgroundSize: "22px 22px",
+    }),
+  },
+  {
+    id: "papel",
+    nome: "Caderno",
+    arte: () => ({
+      backgroundImage: `repeating-linear-gradient(180deg, transparent 0 31px, ${soft("var(--line)", 80)} 31px 32px)`,
+    }),
+  },
+  {
+    id: "aurora2",
+    nome: "Brasa",
+    arte: () => ({
+      backgroundImage:
+        `radial-gradient(80% 60% at 50% 108%, ${soft("var(--neon2)", 22)} 0%, transparent 72%)`,
+    }),
+  },
+  {
+    id: "moldura",
+    nome: "Moldura",
+    arte: () => ({
+      backgroundImage: "none",
+      boxShadow: `inset 0 0 0 1px ${soft("var(--neon)", 30)}, inset 0 0 0 7px ${soft("var(--neon)", 7)}`,
+    }),
+  },
+];
+
+/* Peso da letra da pergunta. Tem quem leia melhor com a pergunta em peso
+   normal, e tem quem queira ela gritando na tela. */
+const PESOS_CARTAO = [
+  { id: "leve", nome: "Leve", frente: 500, verso: 400 },
+  { id: "normal", nome: "Normal", frente: 650, verso: 550 },
+  { id: "forte", nome: "Forte", frente: 800, verso: 650 },
+];
+
+/* Espaço entre as linhas. Texto de cartão com imagem no meio pede mais
+   respiro; cartão de uma linha só pede menos. */
+const ALTURAS_CARTAO = [
+  { id: "apertado", nome: "Apertado", fator: 0.86 },
+  { id: "normal", nome: "Normal", fator: 1 },
+  { id: "solto", nome: "Solto", fator: 1.2 },
+];
+
+/* Multiplicador em cima dos tamanhos que o cartão já usava. Guardar o
+   multiplicador, e não o tamanho em pixel, é o que mantém a diferença
+   entre pergunta e resposta e a adaptação à largura da tela: os tamanhos
+   são clamp(), e trocá-los por um número fixo faria a pergunta caber na
+   tela grande e estourar no celular. */
+const TAMANHOS_CARTAO = [
+  { id: "pequeno", nome: "Pequeno", fator: 0.85 },
+  { id: "normal", nome: "Normal", fator: 1 },
+  { id: "grande", nome: "Grande", fator: 1.18 },
+  { id: "enorme", nome: "Enorme", fator: 1.4 },
+];
+
+const FONTES_CARTAO = [
+  { id: "app", nome: "A do app", pilha: "var(--f-ui)" },
+  { id: "serif", nome: "Serifada", pilha: "var(--f-serif)" },
+  { id: "mono", nome: "Monoespaçada", pilha: "var(--f-mono)" },
+  { id: "sistema", nome: "Do aparelho", pilha: '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif' },
+  /* Georgia e Verdana vêm com praticamente todo sistema, e são as duas
+     escolhas clássicas de quem lê muito texto na tela: uma serifada de
+     letra larga, uma sem serifa de letra aberta. Nada para baixar. */
+  { id: "leitura", nome: "Leitura", pilha: 'Georgia,"Times New Roman",serif' },
+  { id: "aberta", nome: "Aberta", pilha: 'Verdana,Geneva,sans-serif' },
+];
+
+const ESTILO_PADRAO = {
+  fonte: "app", tamanho: "normal", fundo: "limpo", alinhar: "centro",
+  peso: "normal", altura: "normal",
+};
+
+const estiloDoCartao = (data) => ({ ...ESTILO_PADRAO, ...((data && data.cartaoEstilo) || null) });
+
+const fatorDoEstilo = (e) =>
+  (TAMANHOS_CARTAO.find((t) => t.id === e.tamanho) || TAMANHOS_CARTAO[1]).fator;
+
+const fonteDoEstilo = (e) =>
+  (FONTES_CARTAO.find((f) => f.id === e.fonte) || FONTES_CARTAO[0]).pilha;
+
+const arteDoEstilo = (e) =>
+  (FUNDOS_CARTAO.find((f) => f.id === e.fundo) || FUNDOS_CARTAO[0]).arte();
+
+const pesoDoEstilo = (e) =>
+  (PESOS_CARTAO.find((p) => p.id === e.peso) || PESOS_CARTAO[1]);
+
+const alturaDoEstilo = (e) =>
+  (ALTURAS_CARTAO.find((a) => a.id === e.altura) || ALTURAS_CARTAO[1]).fator;
+
+/* clamp(a, b, c) multiplicado: os três números crescem juntos, então a
+   regra de "cabe na tela pequena, não fica minúsculo na grande" continua
+   valendo em qualquer tamanho escolhido. */
+function escalarClamp(valor, fator) {
+  if (fator === 1) return valor;
+  if (typeof valor === "number") return Math.round(valor * fator);
+  return String(valor).replace(/(\d+(?:\.\d+)?)(px|vw)/g,
+    (_, n, un) => `${Math.round(Number(n) * fator * 10) / 10}${un}`);
+}
+
+function EstiloDoCartao({ data, setData }) {
+  const e = estiloDoCartao(data);
+  const mudar = (k, v) => setData((p) => ({ ...p, cartaoEstilo: { ...estiloDoCartao(p), [k]: v } }));
+  const fator = fatorDoEstilo(e);
+
+  const Linha = ({ titulo, itens, campo }) => (
+    <div>
+      <Label>{titulo}</Label>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {itens.map((x) => (
+          <Btn key={x.id} size="sm" tone={e[campo] === x.id ? "primary" : "quiet"}
+            onClick={() => mudar(campo, x.id)}>{x.nome}</Btn>
+        ))}
+      </div>
+    </div>
+  );
+
+  return (
+    <Card className="px-6 py-6">
+      <H color="var(--neon)" icon={<Palette size={16} />}>Estilo do cartão</H>
+      <Label style={{ marginTop: 6 }}>vale para a tela de estudo, e fica guardado na sua conta</Label>
+
+      {/* A prévia usa exatamente o que a tela de estudo usa: um exemplo que
+          não passa pelo mesmo caminho mente sobre o resultado. */}
+      <div className="mt-5 rounded-2xl" style={{
+        background: T.card2, border: `1px solid ${T.line}`,
+        padding: "26px 20px", textAlign: e.alinhar === "esquerda" ? "left" : "center",
+        fontFamily: fonteDoEstilo(e), ...arteDoEstilo(e),
+      }}>
+        <span style={{
+          display: "block", color: T.ink, lineHeight: 1.4 * alturaDoEstilo(e),
+          fontWeight: pesoDoEstilo(e).frente, fontSize: escalarClamp("clamp(22px, 4.4vw, 34px)", fator),
+        }}>Qual a tríade da síndrome nefrítica?</span>
+        <div style={{ height: 1, background: T.line, margin: "20px auto", maxWidth: 180 }} />
+        <span style={{
+          display: "block", color: T.ink, lineHeight: 1.5 * alturaDoEstilo(e),
+          fontWeight: pesoDoEstilo(e).verso, fontSize: escalarClamp("clamp(19px, 3.6vw, 27px)", fator),
+        }}>Hematúria, hipertensão e edema.</span>
+      </div>
+
+      <div className="mt-5 flex flex-col gap-4">
+        <Linha titulo="Letra" itens={FONTES_CARTAO} campo="fonte" />
+        <Linha titulo="Tamanho" itens={TAMANHOS_CARTAO} campo="tamanho" />
+        <Linha titulo="Peso" itens={PESOS_CARTAO} campo="peso" />
+        <Linha titulo="Entrelinha" itens={ALTURAS_CARTAO} campo="altura" />
+        <Linha titulo="Fundo" itens={FUNDOS_CARTAO} campo="fundo" />
+        <Linha titulo="Alinhamento"
+          itens={[{ id: "centro", nome: "Centralizado" }, { id: "esquerda", nome: "À esquerda" }]}
+          campo="alinhar" />
+      </div>
+    </Card>
+  );
+}
+
+/* Quantos cartões a lista desenha de uma vez.
+ *
+ * Sem teto ela desenhava a coleção inteira, e uma coleção de verdade passa
+ * fácil de mil cartões depois de alguns PDFs. Cada cartão é um Card com
+ * dois textos, etiquetas e botões; mil deles derrubam o Safari do iPhone
+ * antes de a tela terminar de pintar. Quarenta cabem numa rolada e chegam
+ * em qualquer aparelho. */
+const POR_PAGINA = 40;
+
+function Cartoes({ data, setData, subjects, today, notify, nuvem, souDono }) {
+  const ativo = useAtivo();
+  const [modo, setModo] = useState("painel");   // painel | estudo | criar
+  const [fila, setFila] = useState([]);
+  const [virado, setVirado] = useState(false);
+  const [feitos, setFeitos] = useState(0);
+  const [novo, setNovo] = useState({ frente: "", verso: "", subjectId: null, baralho: BARALHO_PADRAO, pasta: PASTA_SOLTA });
+  const [erro, setErro] = useState("");
+  const [busca, setBusca] = useState("");
+  const [filtro, setFiltro] = useState("todos");
+  const [baralhoAtivo, setBaralhoAtivo] = useState("todos");
+  const [pastaAtiva, setPastaAtiva] = useState("todas");
+  const [abertas, setAbertas] = useState({});
+  const [renomeando, setRenomeando] = useState(null);   // {tipo, nome, pasta}
+  const [ajustando, setAjustando] = useState(null);     // {nome, pasta}
+  const [confirmando, setConfirmando] = useState(null); // {tipo, nome, pasta}
+  const [novoNome, setNovoNome] = useState("");
+  const [novaPasta, setNovaPasta] = useState("");
+  const [colado, setColado] = useState("");
+  const [nomeImport, setNomeImport] = useState("");
+  const arquivoRef = useRef(null);
+  const [lendo, setLendo] = useState("");
+
+  const cartoes = data.flash || [];
+
+  /* O que está publicado. null = ainda não perguntou; a lista é carregada
+     uma vez ao abrir a aba, e não a cada digitação na busca. */
+  const [publicados, setPublicados] = useState(null);
+  const [publicando, setPublicando] = useState("");
+
+  /* Pela referência, e não pela dependência: o objeto da nuvem já é estável,
+     mas depender dele aqui foi o que fez a lista se recarregar em laço. */
+  const refNuvem = useRef(nuvem);
+  refNuvem.current = nuvem;
+  const quem = nuvem && nuvem.usuario ? nuvem.usuario.uid : "";
+
+  const carregarPublicados = useCallback(async () => {
+    if (!quem) { setPublicados(null); return; }
+    const j = await falarComBaralhos(refNuvem.current, { acao: "listar" });
+    if (j.erro) { setPublicados(null); return; }
+    setPublicados({ lista: j.baralhos || [], precisaPlano: !!j.precisaPlano });
+  }, [quem]);
+
+  useEffect(() => { carregarPublicados(); }, [carregarPublicados]);
+
+  /* Sem baralho, publica a pasta inteira: todos os cartões dela, cada um
+     levando o baralho a que pertence. */
+  const publicar = useCallback(async (pasta, baralho) => {
+    const ehPasta = !baralho;
+    setPublicando(ehPasta ? `pasta|${pasta}` : chaveBaralho(pasta, baralho));
+    const escolhidos = (data.flash || []).filter((c) => (
+      (c.pasta || PASTA_SOLTA) === pasta
+      && (ehPasta || (c.baralho || BARALHO_PADRAO) === baralho)));
+    const j = await falarComBaralhos(refNuvem.current, {
+      acao: "publicar",
+      tipo: ehPasta ? "pasta" : "baralho",
+      pasta,
+      baralho: baralho || "",
+      cartoes: escolhidos.map((c) => ({ ...c, baralho: c.baralho || BARALHO_PADRAO })),
+    });
+    setPublicando("");
+    if (j.erro) { notify(j.erro); return; }
+    notify(j.mensagem || "Publicado.");
+    carregarPublicados();
+  }, [data.flash, nuvem, notify, carregarPublicados]);
+
+  const baralhos = useMemo(() => {
+    const m = new Map();
+    for (const c of cartoes) {
+      const b = c.baralho || BARALHO_PADRAO;
+      if (!m.has(b)) m.set(b, { nome: b, total: 0, hoje: 0 });
+      const g = m.get(b);
+      g.total += 1;
+      if ((c.prox || today) <= today) g.hoje += 1;
+    }
+    return [...m.values()].sort((a, b) => b.hoje - a.hoje || a.nome.localeCompare(b.nome));
+  }, [cartoes, today]);
+
+  const pastas = useMemo(
+    () => agruparEmPastas(cartoes, today, data.pastas || []),
+    [cartoes, today, data.pastas]
+  );
+  const nomesDePasta = useMemo(
+    () => [...new Set([PASTA_SOLTA, ...pastas.map((p) => p.nome)])],
+    [pastas]
+  );
+
+  const renomear = useCallback(() => {
+    const alvo = renomeando;
+    const nome = novoNome.trim().slice(0, 40);
+    if (!alvo || !nome) return;
+    setData((p) => {
+      const flash = (p.flash || []).map((c) => {
+        const cp = c.pasta || PASTA_SOLTA, cb = c.baralho || BARALHO_PADRAO;
+        if (alvo.tipo === "pasta" && cp === alvo.nome) return { ...c, pasta: nome };
+        if (alvo.tipo === "baralho" && cb === alvo.nome && cp === alvo.pasta) return { ...c, baralho: nome };
+        return c;
+      });
+      const pastasSalvas = alvo.tipo === "pasta"
+        ? [...new Set((p.pastas || []).map((x) => (x === alvo.nome ? nome : x)))]
+        : (p.pastas || []);
+      const cfgs = moverCfg(p.baralhoCfg, (pasta, baralho) => {
+        if (alvo.tipo === "pasta" && pasta === alvo.nome) return { pasta: nome, baralho };
+        if (alvo.tipo === "baralho" && baralho === alvo.nome && pasta === alvo.pasta) {
+          return { pasta, baralho: nome };
+        }
+        return null;
+      });
+      return { ...p, flash, pastas: pastasSalvas, baralhoCfg: cfgs };
+    });
+    if (alvo.tipo === "pasta") {
+      if (pastaAtiva === alvo.nome) setPastaAtiva(nome);
+      setAbertas((a) => ({ ...a, [nome]: true }));
+    } else if (baralhoAtivo === alvo.nome) setBaralhoAtivo(nome);
+    setRenomeando(null); setNovoNome("");
+    notify("Nome alterado.");
+  }, [renomeando, novoNome, setData, notify, pastaAtiva, baralhoAtivo]);
+
+  const mudarCfg = useCallback((pasta, baralho, campo, valor) => {
+    const k = chaveBaralho(pasta, baralho);
+    setData((p) => ({
+      ...p,
+      baralhoCfg: { ...(p.baralhoCfg || {}), [k]: { ...lerCfg(p.baralhoCfg, k), [campo]: valor } },
+    }));
+  }, [setData]);
+
+  const moverBaralho = useCallback((baralho, dePasta, paraPasta) => {
+    if (dePasta === paraPasta) return;
+    setData((p) => ({
+      ...p,
+      flash: (p.flash || []).map((c) => (
+        (c.baralho || BARALHO_PADRAO) === baralho && (c.pasta || PASTA_SOLTA) === dePasta
+          ? { ...c, pasta: paraPasta } : c
+      )),
+      pastas: registrarPasta(p.pastas, paraPasta),
+      baralhoCfg: moverCfg(p.baralhoCfg, (pasta, b) => (
+        b === baralho && pasta === dePasta ? { pasta: paraPasta, baralho: b } : null)),
+    }));
+    setAbertas((a) => ({ ...a, [paraPasta]: true }));
+    notify(`"${baralho}" foi para "${paraPasta}".`);
+  }, [setData, notify]);
+
+  const criarPasta = useCallback(() => {
+    const nome = novaPasta.trim().slice(0, 40);
+    if (!nome) return;
+    if (nome === PASTA_SOLTA) { notify(`"${PASTA_SOLTA}" é o nome reservado das soltas.`); return; }
+    if (pastas.some((p) => p.nome === nome)) { notify("Já existe uma pasta com esse nome."); return; }
+    /* fica guardada junto com os dados, senão sumiria ao recarregar,
+       porque uma pasta recém-criada ainda não tem cartão apontando nela */
+    setData((p) => ({ ...p, pastas: registrarPasta(p.pastas, nome) }));
+    setAbertas((a) => ({ ...a, [nome]: true }));
+    setPastaAtiva(nome);
+    setNovaPasta("");
+    notify(`Pasta "${nome}" criada. Mova um baralho para dentro dela.`);
+  }, [novaPasta, notify, setData, pastas]);
+
+  /* Apagar a pasta não apaga cartão: os baralhos de dentro voltam para as
+     soltas. Quem quiser apagar cartão apaga o baralho. */
+  const apagarPasta = useCallback((nome) => {
+    setData((p) => ({
+      ...p,
+      flash: (p.flash || []).map((c) => ((c.pasta || PASTA_SOLTA) === nome ? { ...c, pasta: PASTA_SOLTA } : c)),
+      pastas: (p.pastas || []).filter((x) => x !== nome),
+      baralhoCfg: moverCfg(p.baralhoCfg, (pasta, b) => (
+        pasta === nome ? { pasta: PASTA_SOLTA, baralho: b } : null)),
+    }));
+    setAbertas((a) => { const n = { ...a }; delete n[nome]; return n; });
+    if (pastaAtiva === nome) { setPastaAtiva("todas"); setBaralhoAtivo("todos"); }
+    setConfirmando(null);
+    notify(`Pasta "${nome}" desfeita. Os baralhos foram para "${PASTA_SOLTA}".`);
+  }, [setData, notify, pastaAtiva]);
+
+  const apagarBaralho = useCallback((baralho, pasta) => {
+    setData((p) => ({
+      ...p,
+      flash: (p.flash || []).filter((c) => !(
+        (c.baralho || BARALHO_PADRAO) === baralho && (c.pasta || PASTA_SOLTA) === pasta
+      )),
+      baralhoCfg: Object.fromEntries(Object.entries(p.baralhoCfg || {})
+        .filter(([k]) => k !== chaveBaralho(pasta, baralho))),
+    }));
+    if (baralhoAtivo === baralho) setBaralhoAtivo("todos");
+    setConfirmando(null);
+    notify(`Baralho "${baralho}" apagado.`);
+  }, [setData, notify, baralhoAtivo]);
+
+  const doBaralho = useMemo(() => cartoes.filter((c) => {
+    if (pastaAtiva !== "todas" && (c.pasta || PASTA_SOLTA) !== pastaAtiva) return false;
+    if (baralhoAtivo !== "todos" && (c.baralho || BARALHO_PADRAO) !== baralhoAtivo) return false;
+    return true;
+  }), [cartoes, pastaAtiva, baralhoAtivo]);
+
+  const vencidos = useMemo(
+    () => doBaralho.filter((c) => (c.prox || today) <= today),
+    [doBaralho, today]
+  );
+
+  const importar = useCallback((texto, origem) => {
+    const base = (origem || "").replace(/\.[^.]+$/, "").slice(0, 40) || BARALHO_PADRAO;
+    const novos = lerImportacao(texto, base).map((c) => ({ ...c, pasta: base }));
+    if (novos.length === 0) {
+      setErro("Não encontrei nenhum par de pergunta e resposta nesse conteúdo.");
+      return;
+    }
+    setErro("");
+    setData((p) => ({ ...p, flash: [...novos, ...(p.flash || [])], pastas: registrarPasta(p.pastas, base) }));
+    setAbertas((a) => ({ ...a, [base]: true }));
+    notify(`${novos.length} cartõe${novos.length === 1 ? "" : "s"} importado${novos.length === 1 ? "" : "s"} para "${base}".`);
+    setColado("");
+    setNomeImport("");
+  }, [setData, notify]);
+
+  const arquivoEscolhido = async (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (!f) return;
+    setErro("");
+
+    if (/\.apkg$/i.test(f.name)) {
+      setLendo("abrindo o arquivo");
+      try {
+        const r = await lerApkg(f, setLendo);
+        if (r.cartoes.length === 0) {
+          setErro("Não encontrei notas com frente e verso nessa coleção.");
+          return;
+        }
+        const comPasta = r.cartoes.map((c) => ({ ...c, pasta: r.baralho }));
+        setData((p) => ({ ...p, flash: [...comPasta, ...(p.flash || [])], pastas: registrarPasta(p.pastas, r.baralho) }));
+        setAbertas((a) => ({ ...a, [r.baralho]: true }));
+        const mb = r.peso ? ` e ${(r.peso / 1048576).toFixed(1)} MB de imagens` : "";
+        notify(`${r.cartoes.length} cartões de "${r.baralho}"${r.imagens ? `, com ${r.imagens} imagens${mb}` : ""}.`);
+      } catch (err) {
+        setErro((err && err.message) || "Não consegui ler esse arquivo do Anki.");
+      } finally { setLendo(""); }
+      return;
+    }
+
+    const rd = new FileReader();
+    rd.onload = () => importar(String(rd.result), f.name);
+    rd.onerror = () => setErro("Não consegui ler o arquivo.");
+    rd.readAsText(f);
+  };
+
+  const resumo = useMemo(() => {
+    const r = { novo: 0, aprendendo: 0, firme: 0 };
+    for (const c of doBaralho) r[estagio(c)] += 1;
+    return r;
+  }, [doBaralho]);
+
+  /* Sem escopo, estuda o que estiver filtrado na tela; com escopo, estuda um
+     baralho só — que é o botão de play na linha de cada baralho. */
+  const comecar = (escopo) => {
+    const lista = escopo
+      ? cartoes.filter((c) => (c.pasta || PASTA_SOLTA) === escopo.pasta
+        && (c.baralho || BARALHO_PADRAO) === escopo.baralho)
+      : doBaralho;
+
+    const nova = filaDeVarios(lista, today, data.baralhoCfg);
+    if (nova.length === 0) {
+      return notify(escopo
+        ? `Nada para hoje em "${escopo.baralho}".`
+        : "Nenhum cartão para hoje.");
+    }
+    if (escopo) { setPastaAtiva(escopo.pasta); setBaralhoAtivo(escopo.baralho); }
+    setFila(nova.map((c) => c.id));
+    setFeitos(0);
+    setVirado(false);
+    setModo("estudo");
+  };
+
+  const atual = fila.length ? cartoes.find((c) => c.id === fila[0]) : null;
+
+  const responder = useCallback((nota) => {
+    if (!atual) return;
+    const atualizado = reagendar(atual, nota);
+    setData((p) => ({
+      ...p,
+      flash: (p.flash || []).map((c) => (c.id === atual.id ? atualizado : c)),
+    }));
+    setVirado(false);
+    setFeitos((n) => n + 1);
+    setFila((f) => {
+      const resto = f.slice(1);
+      /* errou volta para o fim da fila, para ser visto de novo hoje */
+      return nota === "errei" ? [...resto, atual.id] : resto;
+    });
+  }, [atual, setData]);
+
+  useEffect(() => {
+    estudandoCartoes = modo === "estudo";
+    return () => { estudandoCartoes = false; };
+  }, [modo]);
+
+  useEffect(() => {
+    if (modo !== "estudo") return undefined;
+    const h = (e) => {
+      const el = e.target;
+      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA")) return;
+      if (e.code === "Space") { e.preventDefault(); setVirado((v) => !v); return; }
+      if (!virado) return;
+      const i = ["1", "2", "3", "4"].indexOf(e.key);
+      if (i >= 0) responder(NOTAS[i].id);
+    };
+    window.addEventListener("keydown", h);
+    return () => window.removeEventListener("keydown", h);
+  }, [modo, virado, responder]);
+
+  const criar = () => {
+    if (!novo.frente.trim()) return setErro("Escreva a pergunta.");
+    if (!novo.verso.trim()) return setErro("Escreva a resposta.");
+    setErro("");
+    setData((p) => ({
+      ...p,
+      flash: [novoCartao(novo.frente.trim(), novo.verso.trim(), novo.subjectId, novo.baralho, novo.pasta), ...(p.flash || [])],
+      pastas: registrarPasta(p.pastas, (novo.pasta || "").trim().slice(0, 40)),
+    }));
+    setNovo((p) => ({ frente: "", verso: "", subjectId: p.subjectId, baralho: p.baralho, pasta: p.pasta }));
+    notify("Cartão criado.");
+  };
+
+  const apagar = (id) => setData((p) => ({ ...p, flash: (p.flash || []).filter((c) => c.id !== id) }));
+
+  /* Quantos cartões estão desenhados agora. Volta ao começo quando a busca
+     ou o filtro mudam: continuar em 200 depois de filtrar para 3 seria
+     desenhar uma lista que não existe mais. */
+  const [quantos, setQuantos] = useState(POR_PAGINA);
+  useEffect(() => { setQuantos(POR_PAGINA); }, [busca, filtro, baralhoAtivo, pastaAtiva]);
+
+  /* O visual escolhido em "Estilo do cartão", lido uma vez e usado tanto
+     pela pergunta quanto pela resposta. */
+  const estilo = estiloDoCartao(data);
+  const fatorCartao = fatorDoEstilo(estilo);
+
+  /* ── modo de estudo ─────────────────────────────────────────────── */
+  if (modo === "estudo") {
+    if (!atual) {
+      return (
+        <Card className="px-6 py-14 text-center" brilho="var(--ok)">
+          <div className="flex justify-center" style={{ color: T.ok }}>
+            <span className="flex items-center justify-center rounded-full" style={{ width: 56, height: 56, background: soft("var(--ok)", 16) }}>
+              <Check size={26} />
+            </span>
+          </div>
+          <h2 style={{ fontFamily: F_SERIF, fontSize: 25, fontWeight: 400, margin: "18px 0 0", color: T.ink }}>
+            Sessão encerrada
+          </h2>
+          <Label style={{ marginTop: 10 }}>{feitos} resposta{feitos === 1 ? "" : "s"} nesta rodada</Label>
+          <div className="mt-7 flex justify-center gap-2 flex-wrap">
+            <Btn tone="primary" onClick={() => setModo("painel")}>Voltar ao painel</Btn>
+            {vencidos.length ? <Btn onClick={() => comecar()}>Estudar de novo</Btn> : null}
+          </div>
+        </Card>
+      );
+    }
+
+    const aula = atual.subjectId ? ativo.byId[atual.subjectId] : null;
+
+    /* Tela cheia de verdade: por cima de tudo, sem o cabeçalho, o menu e o
+       rodapé disputando espaço com o cartão. Era isso que deixava uma coisa
+       em cima da outra, principalmente no celular.
+
+       A altura usa dvh, e não vh: no celular a barra do navegador some e
+       aparece durante a rolagem, e com vh o rodapé de botões ficava
+       escondido atrás dela justamente na hora de responder.
+
+       E precisa ser um portal, direto no <body>: o conteúdo da aba mora
+       dentro da .rise, que anima a entrada com transform. A animação some
+       rápido, mas o transform que ela deixa (ainda que vire "none" no fim)
+       continua contando como um transform de verdade para o navegador, e
+       isso faz qualquer descendente com position:fixed passar a se
+       posicionar relativo a essa div, em vez da tela — o cartão em tela
+       cheia nascia empurrado para baixo da altura do cabeçalho, cortando o
+       "ver a resposta" fora da parte visível, sem nada para rolar até lá.
+       Um portal escapa da .rise de vez, então position:fixed volta a
+       significar a tela inteira. */
+    return createPortal((
+      <div style={{
+        position: "fixed", inset: 0, zIndex: 60,
+        background: T.bg, display: "flex", flexDirection: "column",
+        height: "100dvh", maxHeight: "100dvh",
+        paddingTop: "env(safe-area-inset-top)",
+        paddingBottom: "env(safe-area-inset-bottom)",
+      }}>
+        {/* ── barra de cima ─────────────────────────────────────────── */}
+        <div style={{ flexShrink: 0, borderBottom: `1px solid ${T.line}` }}>
+          <div className="flex items-center justify-between gap-3 px-4 sm:px-6"
+            style={{ height: 56 }}>
+            <div className="flex items-center gap-2.5 min-w-0">
+              <Num size={19} weight={700} color="var(--neon)">{fila.length}</Num>
+              <Label>na fila</Label>
+              <span style={{ width: 1, height: 16, background: T.line, flexShrink: 0 }} />
+              <Num size={19} weight={700} color={T.dim}>{feitos}</Num>
+              <Label>feitos</Label>
+            </div>
+            <div className="flex items-center gap-2" style={{ flexShrink: 0 }}>
+              <Mini style={{ display: "none" }} className="sm:inline">
+                {baralhoAtivo === "todos" ? "" : baralhoAtivo}
+              </Mini>
+              <button type="button" aria-label="Encerrar o estudo"
+                onClick={() => setModo("painel")}
+                className="flex items-center justify-center rounded-full brilhar"
+                style={{
+                  width: 38, height: 38, background: T.card2,
+                  border: `1px solid ${T.line}`, color: T.dim, cursor: "pointer",
+                }}>
+                <X size={17} />
+              </button>
+            </div>
+          </div>
+          <Track pct={(feitos / Math.max(1, feitos + fila.length)) * 100} color="var(--neon)" height={3} />
+        </div>
+
+        {/* ── o cartão ──────────────────────────────────────────────── *
+         * Centralizado na vertical, a pergunta ficava boiando no meio de um
+         * vazio enorme numa tela alta de celular — muito espaço morto acima
+         * e o botão "ver a resposta" perdido lá embaixo. Começando do topo,
+         * a pergunta some para logo abaixo da barra, e sobra espaço embaixo
+         * para a resposta aparecer quando o cartão for virado. */}
+        <div onClick={() => setVirado((v) => !v)}
+          style={{
+            flex: 1, minHeight: 0, overflowY: "auto", cursor: "pointer",
+            display: "flex", flexDirection: "column",
+            alignItems: "center", justifyContent: "flex-start",
+            padding: "28px 20px",
+            fontFamily: fonteDoEstilo(estilo),
+            ...arteDoEstilo(estilo),
+          }}>
+          <div style={{
+            width: "100%", maxWidth: 760,
+            textAlign: estilo.alinhar === "esquerda" ? "left" : "center",
+          }}>
+            {aula ? (
+              <div className="flex items-center justify-center gap-2" style={{ marginBottom: 22 }}>
+                <Chip area={aula.area} small />
+                <Mini>{aula.esp}</Mini>
+              </div>
+            ) : null}
+
+            {/* A pergunta continua visível junto da resposta: some ela e a
+                pessoa responde sem lembrar o que foi perguntado. */}
+            <LadoDoCartao
+              texto={atual.frente}
+              imagens={atual.imgFrente}
+              tamanho={escalarClamp(virado ? "clamp(17px, 3vw, 21px)" : "clamp(22px, 4.4vw, 34px)", fatorCartao)}
+              peso={virado ? pesoDoEstilo(estilo).verso : pesoDoEstilo(estilo).frente}
+              entrelinha={alturaDoEstilo(estilo)}
+              altura={virado ? 200 : 320} />
+
+            {virado ? (
+              <>
+                <div style={{
+                  height: 1, background: T.line, margin: "26px auto",
+                  maxWidth: 220,
+                }} />
+                <LadoDoCartao
+                  texto={atual.verso}
+                  imagens={atual.imgVerso}
+                  tamanho={escalarClamp("clamp(19px, 3.6vw, 27px)", fatorCartao)}
+                  peso={pesoDoEstilo(estilo).verso}
+                  entrelinha={alturaDoEstilo(estilo)}
+                  altura={340} />
+              </>
+            ) : (
+              <Mini style={{ marginTop: 34, display: "block" }}>
+                toque em qualquer lugar, ou aperte espaço, para ver a resposta
+              </Mini>
+            )}
+          </div>
+        </div>
+
+        {/* ── as respostas ──────────────────────────────────────────── */}
+        <div style={{
+          flexShrink: 0, borderTop: `1px solid ${T.line}`,
+          padding: "14px 16px 18px", background: T.bg2,
+        }}>
+          {virado ? (
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5"
+              style={{ maxWidth: 760, margin: "0 auto" }}>
+              {NOTAS.map((n) => (
+                <button key={n.id} type="button" onClick={() => responder(n.id)}
+                  className="rounded-2xl px-3 py-3 flex flex-col items-center gap-0.5 nota"
+                  style={{
+                    background: soft(n.cor, 12), border: `1px solid ${soft(n.cor, 36)}`,
+                    color: n.cor, cursor: "pointer", "--c": n.cor,
+                  }}>
+                  <span style={{ fontSize: 16, fontWeight: 700 }}>{n.rotulo}</span>
+                  <span style={{ fontSize: 11.5, color: T.faint }}>{n.dica}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
+            <div className="flex justify-center">
+              <Btn tone="primary" onClick={() => setVirado(true)}>Ver a resposta</Btn>
+            </div>
+          )}
+        </div>
+      </div>
+    ), document.body);
+  }
+
+  /* ── painel ─────────────────────────────────────────────────────── */
+  const lista = doBaralho.filter((c) => {
+    if (filtro !== "todos" && estagio(c) !== filtro) return false;
+    const t = busca.trim().toLowerCase();
+    if (!t) return true;
+    const aula = c.subjectId ? ativo.byId[c.subjectId] : null;
+    return c.frente.toLowerCase().includes(t) || c.verso.toLowerCase().includes(t)
+      || (aula && aula.title.toLowerCase().includes(t));
+  });
+
+  return (
+    <div className="flex flex-col gap-5">
+      <Card className="px-6 py-6" brilho="var(--neon)" tilt>
+        <H color="var(--neon)" icon={<Layers size={16} />}>Seus cartões</H>
+        <Texto style={{ marginTop: 8 }}>
+          Você escreve a pergunta e a resposta. O intervalo até o cartão voltar
+          cresce conforme você acerta, e encolhe quando erra.
+        </Texto>
+
+        <div className="mt-6 flex items-center gap-5 flex-wrap">
+          <Medidor pct={cartoes.length ? (vencidos.length / cartoes.length) * 100 : 0} cor="var(--neon)" tamanho={92} largura={7}>
+            <Num size={24} weight={700} color="var(--neon)">{vencidos.length}</Num>
+            <Mini style={{ fontSize: 11 }}>para hoje</Mini>
+          </Medidor>
+          <div className="flex gap-6 flex-wrap">
+            <div><Num size={22} weight={700}>{cartoes.length}</Num><Mini style={{ marginTop: 3 }}>no total</Mini></div>
+            <div><Num size={22} weight={700} color="var(--a-GO)">{resumo.novo}</Num><Mini style={{ marginTop: 3 }}>novos</Mini></div>
+            <div><Num size={22} weight={700} color="var(--warn)">{resumo.aprendendo}</Num><Mini style={{ marginTop: 3 }}>aprendendo</Mini></div>
+            <div><Num size={22} weight={700} color="var(--ok)">{resumo.firme}</Num><Mini style={{ marginTop: 3 }}>firmes</Mini></div>
+          </div>
+        </div>
+
+        <div className="mt-6 flex gap-2 flex-wrap">
+          <Btn tone="primary" onClick={() => comecar()} disabled={vencidos.length === 0}>
+            <Play size={15} /> Estudar {vencidos.length ? `(${vencidos.length})` : ""}
+          </Btn>
+          <Btn onClick={() => setModo(modo === "criar" ? "painel" : "criar")}>
+            <Plus size={15} /> Novo cartão
+          </Btn>
+          <Btn onClick={() => setModo(modo === "importar" ? "painel" : "importar")}>
+            <Upload size={15} /> Trazer baralho
+          </Btn>
+        </div>
+
+        {cartoes.length || (data.pastas || []).length ? (
+          <div className="mt-6 pt-5" style={{ borderTop: `1px solid ${T.line}` }}>
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <Label>Pastas e baralhos</Label>
+              {/* No celular a largura fixa do campo empurrava o botão para
+                  fora da linha, e os dois subiam por cima do rótulo. Com
+                  base de 260px, o par desce para uma linha só dele quando
+                  não sobra espaço ao lado do rótulo. */}
+              <div className="flex gap-2 items-center justify-end" style={{ flex: "1 1 260px", minWidth: 0 }}>
+                <TextInput value={novaPasta} placeholder="Nova pasta"
+                  onChange={(e) => setNovaPasta(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter") criarPasta(); }}
+                  style={{ flex: "1 1 110px", minWidth: 0, maxWidth: 170, padding: "8px 12px", fontSize: 14 }} />
+                <Btn size="sm" className="shrink-0" onClick={criarPasta}><Plus size={14} /> Criar pasta</Btn>
+              </div>
+            </div>
+
+            <button type="button" onClick={() => { setPastaAtiva("todas"); setBaralhoAtivo("todos"); }}
+              className="rounded-full px-4 py-2 mt-4 brilhar"
+              style={{
+                background: pastaAtiva === "todas" && baralhoAtivo === "todos" ? T.card3 : "transparent",
+                border: `1px solid ${T.line}`, color: T.ink, fontSize: 13.5, cursor: "pointer",
+              }}>Ver tudo</button>
+
+            <div className="flex flex-col gap-2 mt-3">
+              {pastas.map((p) => {
+                const aberta = abertas[p.nome] !== false && (abertas[p.nome] || pastaAtiva === p.nome || pastas.length <= 3);
+                const editandoPasta = renomeando && renomeando.tipo === "pasta" && renomeando.nome === p.nome;
+                const confirmaPasta = confirmando && confirmando.tipo === "pasta" && confirmando.nome === p.nome;
+                const selPasta = pastaAtiva === p.nome && baralhoAtivo === "todos";
+                return (
+                  <div key={p.nome} className="rounded-2xl"
+                    style={{
+                      border: `1px solid ${selPasta ? soft("var(--neon)", 45) : T.line}`,
+                      background: T.card2,
+                      boxShadow: selPasta ? `0 0 24px -14px var(--neon)` : "none",
+                    }}>
+                    <div className="flex items-center gap-2 px-4 py-3">
+                      <button type="button" aria-label={aberta ? "Fechar pasta" : "Abrir pasta"}
+                        onClick={() => setAbertas((a) => ({ ...a, [p.nome]: !aberta }))}
+                        className="toque flex items-center justify-center"
+                        style={{ background: "none", border: "none", cursor: "pointer", padding: 0, flexShrink: 0 }}>
+                        <ChevronDown size={15} style={{ color: T.faint, transform: aberta ? "none" : "rotate(-90deg)", transition: "transform .2s" }} />
+                      </button>
+                      {editandoPasta ? (
+                        <div className="flex gap-2 items-center flex-1 flex-wrap">
+                          <TextInput value={novoNome} autoFocus
+                            onChange={(e) => setNovoNome(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === "Enter") renomear(); if (e.key === "Escape") setRenomeando(null); }}
+                            style={{ padding: "7px 11px", fontSize: 14, flex: 1, minWidth: 140 }} />
+                          <Btn size="sm" tone="primary" onClick={renomear}>Salvar</Btn>
+                          <Btn size="sm" tone="outline" onClick={() => setRenomeando(null)}>cancelar</Btn>
+                        </div>
+                      ) : (
+                        <>
+                          {/* clicar no nome filtra a lista por esta pasta */}
+                          <button type="button"
+                            onClick={() => {
+                              setBaralhoAtivo("todos");
+                              setPastaAtiva(selPasta ? "todas" : p.nome);
+                            }}
+                            className="flex items-center gap-2.5 flex-1 min-w-0"
+                            style={{ background: "none", border: "none", cursor: "pointer", padding: 0, textAlign: "left" }}>
+                            <Layers size={15} style={{ color: p.nome === PASTA_SOLTA ? T.ghost : "var(--neon)", flexShrink: 0 }} />
+                            {/* No celular o nome e a contagem não cabem lado a
+                                lado: a contagem desce para a segunda linha em
+                                vez de comer o nome da pasta. */}
+                            <span className="flex flex-col sm:flex-row sm:items-center gap-0.5 sm:gap-2.5 flex-1 min-w-0">
+                              <span data-teste="nome-pasta" style={{ fontSize: 15, fontWeight: selPasta ? 700 : 600, color: selPasta ? "var(--neon)" : T.ink, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{p.nome}</span>
+                              <span className="flex items-center gap-2 min-w-0 flex-wrap">
+                                <Mini style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+                                  {p.baralhos.length
+                                    ? `${p.baralhos.length} baralho${p.baralhos.length === 1 ? "" : "s"} · ${p.total} cartõe${p.total === 1 ? "" : "s"}`
+                                    : "vazia"}
+                                </Mini>
+                                {p.hoje ? (
+                                  <span style={{ fontFamily: F_MONO, fontSize: 10.5, background: soft("var(--warn)", 20), color: T.warn, borderRadius: 99, padding: "1px 7px", flexShrink: 0 }}>
+                                    {p.hoje} hoje
+                                  </span>
+                                ) : null}
+                              </span>
+                            </span>
+                          </button>
+                          {p.nome !== PASTA_SOLTA ? (
+                            <div className="flex items-center gap-1" style={{ flexShrink: 0 }}>
+                              {souDono && p.total ? (
+                                <button type="button" aria-label={`Publicar a pasta ${p.nome}`}
+                                  title="Publicar a pasta inteira, com os baralhos de dentro"
+                                  onClick={() => publicar(p.nome)}
+                                  disabled={publicando === `pasta|${p.nome}`}
+                                  className="toque rounded-full px-3"
+                                  style={{
+                                    background: soft("var(--ok)", 12), border: `1px solid ${soft("var(--ok)", 32)}`,
+                                    color: T.ok, fontSize: 12.5, fontWeight: 600, cursor: "pointer", minHeight: 28,
+                                  }}>
+                                  {publicando === `pasta|${p.nome}` ? "…" : "publicar"}
+                                </button>
+                              ) : null}
+                              <button type="button" aria-label="Renomear pasta" title="Renomear"
+                                onClick={() => { setRenomeando({ tipo: "pasta", nome: p.nome }); setNovoNome(p.nome); }}
+                                className="toque flex items-center justify-center"
+                                style={{ background: "none", border: "none", color: T.ghost, cursor: "pointer", padding: 4 }}>
+                                <Settings2 size={14} />
+                              </button>
+                              <button type="button" aria-label="Desfazer pasta" title="Desfazer a pasta"
+                                onClick={() => setConfirmando(confirmaPasta ? null : { tipo: "pasta", nome: p.nome })}
+                                className="toque flex items-center justify-center"
+                                style={{ background: "none", border: "none", color: confirmaPasta ? T.bad : T.ghost, cursor: "pointer", padding: 4 }}>
+                                <Trash2 size={14} />
+                              </button>
+                            </div>
+                          ) : null}
+                        </>
+                      )}
+                    </div>
+
+                    {confirmaPasta ? (
+                      <div className="px-4 pb-3 flex items-center gap-2.5 flex-wrap">
+                        <Mini style={{ color: T.bad }}>
+                          Desfazer a pasta? Os {p.baralhos.length} baralho{p.baralhos.length === 1 ? "" : "s"} voltam
+                          para “{PASTA_SOLTA}”. Nenhum cartão é apagado.
+                        </Mini>
+                        <Btn size="sm" tone="danger" onClick={() => apagarPasta(p.nome)}>Desfazer</Btn>
+                        <Btn size="sm" tone="outline" onClick={() => setConfirmando(null)}>cancelar</Btn>
+                      </div>
+                    ) : null}
+
+                    {aberta ? (
+                      <div className="px-4 pb-3 flex flex-col gap-1.5">
+                        {p.baralhos.length === 0 ? (
+                          <Mini style={{ padding: "6px 0 4px" }}>
+                            Pasta vazia. Use o seletor “mover” de um baralho para trazê-lo para cá.
+                          </Mini>
+                        ) : p.baralhos.map((b) => {
+                          const sel = baralhoAtivo === b.nome && pastaAtiva === p.nome;
+                          const editandoB = renomeando && renomeando.tipo === "baralho"
+                            && renomeando.nome === b.nome && renomeando.pasta === p.nome;
+                          const confirmaB = confirmando && confirmando.tipo === "baralho"
+                            && confirmando.nome === b.nome && confirmando.pasta === p.nome;
+                          const abertoB = ajustando && ajustando.nome === b.nome && ajustando.pasta === p.nome;
+                          const cfg = lerCfg(data.baralhoCfg, chaveBaralho(p.nome, b.nome));
+                          const mudou = !cfg.embaralhar || cfg.min > 0 || cfg.max > 0;
+                          return (
+                            <div key={b.nome} className="rounded-xl"
+                              style={{ background: sel ? soft("var(--neon)", 14) : "transparent", border: `1px solid ${sel ? soft("var(--neon)", 40) : T.line}` }}>
+                              {/* A linha ficou com o essencial: o nome, estudar
+                                  e a engrenagem. Mover, renomear e apagar
+                                  desceram para o painel, porque cinco controles
+                                  lado a lado não cabiam na largura do celular. */}
+                              <div className="flex items-center gap-2 px-3 py-2">
+                                <button type="button"
+                                  onClick={() => { setPastaAtiva(p.nome); setBaralhoAtivo(sel ? "todos" : b.nome); }}
+                                  className="flex-1 min-w-0 flex items-center gap-2"
+                                  style={{ background: "none", border: "none", cursor: "pointer", padding: 0, textAlign: "left" }}>
+                                  <span style={{ fontSize: 14.5, fontWeight: sel ? 700 : 500, color: sel ? "var(--neon)" : T.dim, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{b.nome}</span>
+                                  <span style={{ fontFamily: F_MONO, fontSize: 11, color: b.hoje ? T.warn : T.ghost, flexShrink: 0 }}>
+                                    {b.hoje ? `${b.hoje} hoje` : b.total}
+                                  </span>
+                                </button>
+
+                                <button type="button" aria-label={`Estudar ${b.nome}`} title="Estudar só este baralho"
+                                  onClick={() => comecar({ pasta: p.nome, baralho: b.nome })}
+                                  className="toque flex items-center justify-center rounded-full brilhar"
+                                  style={{
+                                    width: 30, height: 30, flexShrink: 0, cursor: "pointer",
+                                    background: b.hoje ? soft("var(--neon)", 16) : "transparent",
+                                    border: `1px solid ${b.hoje ? soft("var(--neon)", 40) : T.line}`,
+                                    color: b.hoje ? "var(--neon)" : T.ghost,
+                                  }}>
+                                  <Play size={13} />
+                                </button>
+
+                                <button type="button" aria-label={`Ajustes de ${b.nome}`} title="Ajustes do baralho"
+                                  onClick={() => { setAjustando(abertoB ? null : { nome: b.nome, pasta: p.nome }); setConfirmando(null); }}
+                                  className="toque flex items-center justify-center rounded-full"
+                                  style={{
+                                    width: 30, height: 30, flexShrink: 0, cursor: "pointer",
+                                    background: abertoB ? T.card3 : "transparent",
+                                    border: `1px solid ${abertoB ? "transparent" : T.line}`,
+                                    color: mudou ? "var(--warn)" : T.ghost,
+                                  }}>
+                                  <Settings2 size={13} />
+                                </button>
+                              </div>
+
+                              {abertoB ? (
+                                <div className="px-3 pb-3 flex flex-col gap-3" style={{ borderTop: `1px solid ${T.line}`, paddingTop: 12 }}>
+                                  {editandoB ? (
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <TextInput value={novoNome} autoFocus
+                                        onChange={(e) => setNovoNome(e.target.value)}
+                                        onKeyDown={(e) => { if (e.key === "Enter") renomear(); if (e.key === "Escape") setRenomeando(null); }}
+                                        style={{ padding: "6px 10px", fontSize: 13.5, flex: 1, minWidth: 130 }} />
+                                      <Btn size="sm" tone="primary" onClick={renomear}>Salvar</Btn>
+                                      <Btn size="sm" tone="outline" onClick={() => setRenomeando(null)}>cancelar</Btn>
+                                    </div>
+                                  ) : (
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <Btn size="sm" tone="outline"
+                                        onClick={() => { setRenomeando({ tipo: "baralho", nome: b.nome, pasta: p.nome }); setNovoNome(b.nome); }}>
+                                        renomear
+                                      </Btn>
+                                      <label className="flex items-center gap-1.5">
+                                        <span style={{ fontSize: 11.5, color: T.ghost }}>mover para</span>
+                                        <select value={p.nome}
+                                          onChange={(e) => moverBaralho(b.nome, p.nome, e.target.value)}
+                                          style={{
+                                            background: T.card2, border: `1px solid ${T.line}`, color: T.dim,
+                                            borderRadius: 5, fontSize: 12.5, padding: "5px 7px", cursor: "pointer", maxWidth: 150,
+                                          }}>
+                                          {nomesDePasta.map((n) => <option key={n} value={n}>{n}</option>)}
+                                        </select>
+                                      </label>
+                                      {souDono ? (
+                                        <Btn size="sm" tone="outline"
+                                          disabled={publicando === chaveBaralho(p.nome, b.nome)}
+                                          onClick={() => publicar(p.nome, b.nome)}>
+                                          {publicando === chaveBaralho(p.nome, b.nome) ? "publicando…" : "publicar"}
+                                        </Btn>
+                                      ) : null}
+                                      <button type="button" aria-label={`Apagar o baralho ${b.nome}`}
+                                        onClick={() => setConfirmando(confirmaB ? null : { tipo: "baralho", nome: b.nome, pasta: p.nome })}
+                                        className="toque-larg rounded-full px-4 py-2"
+                                        style={{
+                                          background: soft("var(--bad)", 12), border: `1px solid ${soft("var(--bad)", 34)}`,
+                                          color: T.bad, fontSize: 13.5, fontWeight: 600, cursor: "pointer",
+                                        }}>
+                                        apagar
+                                      </button>
+                                    </div>
+                                  )}
+
+                                  <label className="flex items-center gap-2.5" style={{ cursor: "pointer" }}>
+                                    <input type="checkbox" checked={cfg.embaralhar}
+                                      onChange={(e) => mudarCfg(p.nome, b.nome, "embaralhar", e.target.checked)} />
+                                    <span style={{ fontSize: 13.5, color: T.dim }}>
+                                      Embaralhar a ordem
+                                      <span style={{ color: T.faint }}> · sem isso você acaba decorando pela posição</span>
+                                    </span>
+                                  </label>
+
+                                  <div className="flex gap-3 flex-wrap">
+                                    <label className="flex items-center gap-2">
+                                      <span style={{ fontSize: 12.5, color: T.ghost, whiteSpace: "nowrap" }}>mín. por dia</span>
+                                      <TextInput type="number" min="0" max="999" value={cfg.min || ""}
+                                        placeholder="0"
+                                        onChange={(e) => mudarCfg(p.nome, b.nome, "min", Math.max(0, Math.min(999, Math.floor(Number(e.target.value) || 0))))}
+                                        style={{ padding: "5px 8px", fontSize: 13, width: 78 }} />
+                                    </label>
+                                    <label className="flex items-center gap-2">
+                                      <span style={{ fontSize: 12.5, color: T.ghost, whiteSpace: "nowrap" }}>máx. por dia</span>
+                                      <TextInput type="number" min="0" max="999" value={cfg.max || ""}
+                                        placeholder="0"
+                                        onChange={(e) => mudarCfg(p.nome, b.nome, "max", Math.max(0, Math.min(999, Math.floor(Number(e.target.value) || 0))))}
+                                        style={{ padding: "5px 8px", fontSize: 13, width: 78 }} />
+                                    </label>
+                                  </div>
+                                  <Mini style={{ lineHeight: 1.6 }}>
+                                    Zero é sem limite. O mínimo adianta os cartões que vencem
+                                    mais cedo, para um dia fraco não ficar curto demais; o
+                                    máximo corta o excesso, para um dia pesado não virar
+                                    desistência.
+                                  </Mini>
+                                </div>
+                              ) : null}
+
+                              {confirmaB ? (
+                                <div className="px-3 pb-2.5 flex items-center gap-2.5 flex-wrap">
+                                  <Mini style={{ color: T.bad }}>
+                                    Apagar “{b.nome}” e os {b.total} cartõe{b.total === 1 ? "" : "s"} dentro dele?
+                                  </Mini>
+                                  <Btn size="sm" tone="danger" onClick={() => apagarBaralho(b.nome, p.nome)}>Apagar</Btn>
+                                  <Btn size="sm" tone="outline" onClick={() => setConfirmando(null)}>cancelar</Btn>
+                                </div>
+                              ) : null}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ) : null}
+      </Card>
+
+      <Card className="px-6 py-6" brilho="var(--neon2)">
+        <H size={18} color="var(--neon2)" icon={<Sparkles size={16} />}>Montar flashcards com IA</H>
+        <Texto style={{ marginTop: 10 }}>
+          Jogue o PDF ou o Word de um assunto aqui e a IA separa o conteúdo em
+          perguntas e respostas prontas para estudar, com as imagens do
+          documento incluídas nos cartões que precisarem delas.
+        </Texto>
+        <div className="mt-5">
+          <MontarFlashcardsIA setData={setData} notify={notify} nuvem={nuvem} pastas={data.pastas} />
+        </div>
+      </Card>
+
+      <EstiloDoCartao data={data} setData={setData} />
+
+      <Publicados nuvem={nuvem} souDono={souDono} setData={setData}
+        notify={notify} publicados={publicados} recarregar={carregarPublicados} />
+
+      {modo === "importar" ? (
+        <Card className="px-6 py-6" brilho="var(--neon)">
+          <H size={18} color="var(--neon)" icon={<Upload size={16} />}>Trazer seus baralhos</H>
+          <Texto style={{ marginTop: 10 }}>
+            Duas colunas por linha: a pergunta e a resposta. Uma terceira coluna,
+            se existir, vira o nome do baralho. Serve arquivo separado por
+            tabulação, ponto e vírgula ou vírgula.
+          </Texto>
+
+          <div className="mt-5 flex flex-wrap gap-2">
+            <Btn tone="primary" disabled={!!lendo} onClick={() => arquivoRef.current && arquivoRef.current.click()}>
+              <Upload size={15} /> {lendo ? "Lendo…" : "Escolher arquivo"}
+            </Btn>
+            <input ref={arquivoRef} type="file" accept=".apkg,.txt,.csv,.tsv,text/plain,text/csv"
+              onChange={arquivoEscolhido} style={{ display: "none" }} />
+            <Btn tone="outline" onClick={() => setModo("painel")}>fechar</Btn>
+          </div>
+
+          <div className="mt-5">
+            <Field label="Ou cole aqui">
+              <Area value={colado} placeholder={"Tríade da síndrome nefrítica\tHematúria, hipertensão e edema\nTratamento da crise asmática\tBeta-2 de curta + corticoide"}
+                onChange={(e) => setColado(e.target.value)} style={{ minHeight: 130, fontFamily: F_MONO, fontSize: 13.5 }} />
+            </Field>
+            <div className="mt-3 flex flex-wrap gap-3 items-end">
+              <div style={{ flex: 1, minWidth: 200 }}>
+                <Field label="Nome do baralho">
+                  <TextInput value={nomeImport} placeholder="Ex.: Cardiologia"
+                    onChange={(e) => setNomeImport(e.target.value)} />
+                </Field>
+              </div>
+              <Btn onClick={() => importar(colado, nomeImport)} disabled={!colado.trim()}>
+                Importar o texto
+              </Btn>
+            </div>
+          </div>
+
+          {lendo ? (
+            <div className="mt-4 rounded-2xl px-4 py-3 breathe" style={{ background: soft("var(--neon)", 12), border: `1px solid ${T.line}` }}>
+              <Mini style={{ color: T.ink }}>{lendo}…</Mini>
+            </div>
+          ) : null}
+          {erro ? <Label style={{ marginTop: 14, color: T.bad, textTransform: "none", letterSpacing: 0, fontSize: 14, lineHeight: 1.6 }}>{erro}</Label> : null}
+
+          <div className="mt-5 pt-5" style={{ borderTop: `1px solid ${T.line}` }}>
+            <Label>Vindo do Anki</Label>
+            <Mini style={{ marginTop: 8, lineHeight: 1.7 }}>
+              O arquivo .apkg entra direto, com as imagens junto. Na hora de
+              exportar no Anki, marque a opção de compatibilidade com versões
+              antigas, porque o formato mais novo vem compactado de um jeito que
+              o navegador não abre. Exportações em texto simples também servem.
+            </Mini>
+          </div>
+        </Card>
+      ) : null}
+
+      {modo === "criar" ? (
+        <Card className="px-6 py-6" brilho="var(--neon2)">
+          <H size={18} color="var(--neon2)" icon={<Plus size={16} />}>Criar cartão</H>
+          <div className="mt-5 flex flex-col gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <Field label="Pasta">
+                <TextInput value={novo.pasta || ""} placeholder="Ex.: Clínica"
+                  onChange={(e) => setNovo((p) => ({ ...p, pasta: e.target.value }))} />
+              </Field>
+              <Field label="Baralho">
+                <TextInput value={novo.baralho} placeholder="Ex.: Cardiologia"
+                  onChange={(e) => setNovo((p) => ({ ...p, baralho: e.target.value }))} />
+              </Field>
+            </div>
+            <Field label="Aula do cronograma (opcional)">
+              <SubjectPicker value={novo.subjectId} onChange={(v) => setNovo((p) => ({ ...p, subjectId: v }))} />
+            </Field>
+            <Field label="Frente, a pergunta">
+              <Area value={novo.frente} placeholder="Ex.: Tríade da síndrome nefrítica"
+                onChange={(e) => setNovo((p) => ({ ...p, frente: e.target.value }))} style={{ minHeight: 80 }} />
+            </Field>
+            <Field label="Verso, a resposta">
+              <Area value={novo.verso} placeholder="Ex.: hematúria, hipertensão e edema"
+                onChange={(e) => setNovo((p) => ({ ...p, verso: e.target.value }))} style={{ minHeight: 110 }} />
+            </Field>
+            <div className="flex items-center gap-3 flex-wrap">
+              <Btn tone="primary" onClick={criar}>Criar cartão</Btn>
+              <Btn tone="outline" onClick={() => setModo("painel")}>fechar</Btn>
+              {erro ? <span style={{ fontSize: 14, color: T.bad }}>{erro}</span> : null}
+              <Mini>a aula fica guardada para o próximo cartão</Mini>
+            </div>
+          </div>
+        </Card>
+      ) : null}
+
+      {cartoes.length === 0 ? (
+        <Card>
+          <Blank icon={<Layers size={26} />} title="Nenhum cartão ainda"
+            hint="Escreva um cartão logo depois de assistir a aula, enquanto o assunto está fresco." />
+        </Card>
+      ) : (
+        <>
+          <div className="flex flex-col sm:flex-row gap-3">
+            <div className="flex items-center gap-2 rounded-full px-4 flex-1" style={{ background: T.card, border: `1px solid ${T.line}` }}>
+              <Search size={15} style={{ color: T.faint }} />
+              <input value={busca} placeholder="Buscar nos seus cartões" onChange={(e) => setBusca(e.target.value)}
+                style={{ ...inp, background: "transparent", border: "none", padding: "11px 0", borderRadius: 0 }} />
+            </div>
+            <div className="flex gap-2 overflow-x-auto pb-1">
+              {[["todos", "Todos"], ["novo", "Novos"], ["aprendendo", "Aprendendo"], ["firme", "Firmes"]].map(([id, lb]) => (
+                <button key={id} type="button" onClick={() => setFiltro(id)} className="rounded-full px-4 py-2 whitespace-nowrap"
+                  style={{
+                    background: filtro === id ? T.card3 : T.card, border: `1px solid ${T.line}`,
+                    color: filtro === id ? T.ink : T.dim, fontSize: 14,
+                    fontWeight: filtro === id ? 700 : 500, cursor: "pointer",
+                  }}>{lb}</button>
+              ))}
+            </div>
+          </div>
+
+          <div className="flex flex-col gap-2">
+            {lista.slice(0, quantos).map((c) => {
+              const aula = c.subjectId ? ativo.byId[c.subjectId] : null;
+              const venceu = (c.prox || today) <= today;
+              const e = estagio(c);
+              return (
+                <Card key={c.id} className="px-5 py-4">
+                  <div className="flex items-start gap-3">
+                    <span style={{
+                      width: 3, alignSelf: "stretch", borderRadius: 3, flexShrink: 0,
+                      background: e === "firme" ? T.ok : e === "aprendendo" ? T.warn : "var(--a-GO)",
+                    }} />
+                    <div className="flex-1 min-w-0">
+                      <LadoDoCartao texto={c.frente} imagens={c.imgFrente} tamanho={15} peso={600} altura={120} semFiguras />
+                      <div style={{ marginTop: 4, opacity: 0.75 }}>
+                        <LadoDoCartao texto={c.verso} imagens={c.imgVerso} tamanho={14} peso={500} altura={120} semFiguras />
+                      </div>
+                      <Mini style={{ marginTop: 6 }}>
+                        {c.baralho && c.baralho !== BARALHO_PADRAO ? `${c.baralho} · ` : ""}
+                        {aula ? `${aula.title} · ` : ""}
+                        {venceu ? "para hoje" : `volta em ${brDate(c.prox)}`}
+                        {c.revisoes ? ` · ${c.revisoes} revisõe${c.revisoes === 1 ? "m" : "s"}` : ""}
+                        {c.lapsos ? ` · ${c.lapsos} erro${c.lapsos === 1 ? "" : "s"}` : ""}
+                      </Mini>
+                    </div>
+                    <button type="button" aria-label="Excluir cartão" onClick={() => apagar(c.id)}
+                      style={{ background: "none", border: "none", color: T.ghost, cursor: "pointer", flexShrink: 0 }}>
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                </Card>
+              );
+            })}
+            {lista.length > quantos ? (
+              <div className="flex justify-center mt-2">
+                <Btn size="sm" onClick={() => setQuantos((q) => q + POR_PAGINA)}>
+                  mostrar mais {Math.min(POR_PAGINA, lista.length - quantos)} de {lista.length}
+                </Btn>
+              </div>
+            ) : null}
+            {lista.length === 0 ? (
+              <Card><Blank icon={<Search size={22} />} title="Nada neste filtro" hint="Tente outra busca." /></Card>
+            ) : null}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,1044 @@
+/* ═══════════════════════════════════════════════════════════════════
+   28 · AMIGOS (salas com ranking)
+
+   Uma sala é um nome mais uma senha. Quem confere a senha é o servidor,
+   em /api/salas: se a conferência estivesse aqui, bastaria abrir o código
+   da página para entrar em qualquer sala.
+
+   Os números de cada pessoa ficam em perfis/{uid}, escrito pelo próprio
+   dono. O ranking vem montado do servidor porque, pelas regras do
+   Firestore, o navegador só lê o próprio perfil — sem isso bastaria saber
+   o uid de alguém para bisbilhotar os números dessa pessoa.
+   ═══════════════════════════════════════════════════════════════════ */
+
+const ROTA_SALAS = "/api/salas";
+
+/* De quanto em quanto tempo o ranking se atualiza sozinho enquanto a aba
+   está aberta. Curto demais vira uma chamada por segundo à toa. */
+const RITMO_RANKING = 45000;
+
+/* Os recados pedem resposta rápida, então vão num ritmo mais curto que o
+   ranking — mas só com a aba à vista: em segundo plano ninguém está lendo,
+   e o app ficaria conversando com o servidor à toa. */
+const RITMO_RECADOS = 12000;
+
+/* De quanto em quanto tempo quem está com o cronômetro andando avisa que
+   continua na mesa. O servidor descarta o sinal com mais de 2min30. */
+const RITMO_PRESENCA = 45000;
+
+/* Precisam bater com o MAX_LETRAS e o MAX_MENSAGENS do servidor, que é
+   quem corta de verdade. Aqui é só para a tela não prometer o que a rota
+   vai recusar. */
+const MAX_RECADO = 400;
+const MAX_RECADO_ITENS = 80;
+
+const PERIODOS = [
+  ["hoje", "Hoje"],
+  ["semana", "Semana"],
+  ["mes", "Mês"],
+  ["total", "Desde sempre"],
+];
+
+/* Publica os números de quem está logado, para aparecerem no ranking.
+ *
+ * Vão quatro recortes: o dia, a semana, o mês e o total. Cada um leva junto
+ * a que dia, a que semana e a que mês se refere — sem isso, quem estudou
+ * muito na semana passada e não abriu o app desde então continuaria no topo
+ * do ranking desta semana, com números que já não valem.
+ *
+ * Só números: nada do que foi estudado, nenhuma anotação. */
+function usePerfilPublico(nuvem, nome, sessions, today, mostrar, aoVivo) {
+  const dados = useMemo(() => {
+    const iniSemana = weekStart(today);
+    const mes = String(today).slice(0, 7);
+    const soma = { min: 0, q: 0, ok: 0 };
+    const dia = { min: 0, q: 0, ok: 0 };
+    const sem = { min: 0, q: 0, ok: 0 };
+    const mensal = { min: 0, q: 0, ok: 0 };
+
+    for (const s of sessions || []) {
+      if (!s) continue;
+      const m = Math.max(0, Number(s.minutes) || 0);
+      const q = Math.max(0, Number(s.questions) || 0);
+      const ok = Math.min(q, Math.max(0, Number(s.correct) || 0));
+      soma.min += m; soma.q += q; soma.ok += ok;
+      const d = String(s.date || "");
+      if (d === today) { dia.min += m; dia.q += q; dia.ok += ok; }
+      if (d >= iniSemana && d <= today) { sem.min += m; sem.q += q; sem.ok += ok; }
+      if (d.slice(0, 7) === mes) { mensal.min += m; mensal.q += q; mensal.ok += ok; }
+    }
+
+    /* Quem escolheu não mostrar publica só o nome e o aviso. Zerar aqui, e
+       não esconder na hora de desenhar, é o que garante que os números não
+       saiam do aparelho: eles nem chegam a ser gravados. */
+    if (!mostrar) {
+      return {
+        nome: String(nome || "").trim().slice(0, 40),
+        oculto: true,
+        minutos: 0, questoes: 0, acertos: 0,
+        diaChave: today, diaMinutos: 0, diaQuestoes: 0, diaAcertos: 0,
+        semanaChave: iniSemana, semanaMinutos: 0, semanaQuestoes: 0, semanaAcertos: 0,
+        mesChave: mes, mesMinutos: 0, mesQuestoes: 0, mesAcertos: 0,
+      };
+    }
+
+    return {
+      nome: String(nome || "").trim().slice(0, 40),
+      oculto: false,
+      minutos: Math.round(soma.min), questoes: soma.q, acertos: soma.ok,
+      diaChave: today,
+      diaMinutos: Math.round(dia.min), diaQuestoes: dia.q, diaAcertos: dia.ok,
+      semanaChave: iniSemana,
+      semanaMinutos: Math.round(sem.min), semanaQuestoes: sem.q, semanaAcertos: sem.ok,
+      mesChave: mes,
+      mesMinutos: Math.round(mensal.min), mesQuestoes: mensal.q, mesAcertos: mensal.ok,
+    };
+  }, [nome, sessions, today, mostrar]);
+
+  const ultimo = useRef("");
+
+  useEffect(() => {
+    if (!nuvem || !nuvem.sdk || !nuvem.usuario) return undefined;
+    const assinatura = JSON.stringify(dados);
+    if (assinatura === ultimo.current) return undefined;
+
+    /* Espera o dedo parar: lançar uma sessão mexe nos três números de uma
+       vez, e sem isto seriam três gravações seguidas. */
+    const t = setTimeout(() => {
+      ultimo.current = assinatura;
+      const { F, db } = nuvem.sdk;
+      /* merge para não apagar a marca de "estudando agora", que é gravada
+         em separado, por outro efeito, em outro ritmo. */
+      F.setDoc(F.doc(db, "perfis", nuvem.usuario.uid), {
+        ...dados, atualizadoEm: Date.now(),
+      }, { merge: true }).catch(() => { ultimo.current = ""; });
+    }, 2500);
+    return () => clearTimeout(t);
+  }, [nuvem, dados]);
+
+  /* ── estudando agora ───────────────────────────────────────────────────
+   *
+   * Enquanto o cronômetro anda, o app dá sinal de vida de tempos em tempos.
+   * Fechar a aba não avisa ninguém, então o sinal vem com hora: o servidor
+   * descarta o que ficou velho, e a marca some sozinha.
+   *
+   * Vai só o tempo em andamento. Que matéria está sendo estudada não sai
+   * daqui — a promessa da sala é essa, o ranking mostra números, não o que
+   * cada um está fazendo. */
+  const ativo = !!(aoVivo && aoVivo.ativo && mostrar);
+  const minRef = useRef(0);
+  minRef.current = aoVivo ? Math.max(0, Math.round(aoVivo.minutos || 0)) : 0;
+  const marcado = useRef(false);
+
+  useEffect(() => {
+    if (!nuvem || !nuvem.sdk || !nuvem.usuario) return undefined;
+    const { F, db } = nuvem.sdk;
+    const ref = F.doc(db, "perfis", nuvem.usuario.uid);
+    const marcar = (em) => {
+      marcado.current = !!em;
+      return F.setDoc(ref, {
+        presencaEm: em, presencaMin: em ? minRef.current : 0,
+      }, { merge: true }).catch(() => {});
+    };
+
+    if (!ativo) {
+      /* Apagar na saída faz a marca sumir na hora para quem pausou ou
+         desligou o cronômetro, em vez de esperar o prazo vencer. Quem nunca
+         apareceu como estudando não tem o que apagar. */
+      if (marcado.current) marcar(0);
+      return undefined;
+    }
+    marcar(Date.now());
+    const i = setInterval(() => marcar(Date.now()), RITMO_PRESENCA);
+    return () => clearInterval(i);
+  }, [nuvem, ativo]);
+}
+
+async function falarComSalas(nuvem, corpo) {
+  let token = "";
+  try {
+    if (nuvem && nuvem.sdk && nuvem.sdk.auth && nuvem.sdk.auth.currentUser) {
+      token = await nuvem.sdk.auth.currentUser.getIdToken();
+    }
+  } catch (e) { /* segue sem token, o servidor recusa */ }
+  if (!token) return { erro: "Entre na sua conta para usar as salas." };
+  const { dados, erro } = await chamarApi(ROTA_SALAS, { ...corpo, token }, "As salas de amigos");
+  return erro ? { erro } : dados;
+}
+
+const MEDALHA = ["var(--warn)", "var(--dim)", "var(--a-CL)"];
+
+/* ── quem é quem ───────────────────────────────────────────────────────
+ *
+ * A sala não tem foto de perfil e não vai ter: subir imagem de gente é um
+ * problema inteiro (moderação, armazenamento, o que aparece para quem) para
+ * resolver uma coisa pequena. O que resolve a mesma coisa é a inicial num
+ * círculo, com uma cor tirada do próprio nome: sempre a mesma cor para a
+ * mesma pessoa, e dá para achar alguém na lista de relance. */
+const TONS_FACE = [
+  "var(--a-CL)", "var(--a-CI)", "var(--a-GO)", "var(--a-PE)", "var(--a-PR)",
+  "var(--neon)", "var(--neon2)", "var(--ok)",
+];
+
+function corDoNome(nome) {
+  let n = 0;
+  const s = String(nome || "");
+  for (let i = 0; i < s.length; i += 1) n = (n * 31 + s.charCodeAt(i)) % 99991;
+  return TONS_FACE[n % TONS_FACE.length];
+}
+
+function iniciais(nome) {
+  const partes = String(nome || "").trim().split(/\s+/).filter(Boolean);
+  if (!partes.length) return "?";
+  if (partes.length === 1) return partes[0].slice(0, 2).toUpperCase();
+  return (partes[0][0] + partes[partes.length - 1][0]).toUpperCase();
+}
+
+function Face({ nome, cor, tamanho = 38, forte }) {
+  const c = cor || corDoNome(nome);
+  return (
+    <span className="flex items-center justify-center rounded-full" style={{
+      width: tamanho, height: tamanho, flexShrink: 0,
+      background: `linear-gradient(140deg, ${soft(c, forte ? 30 : 18)}, ${soft(c, 6)})`,
+      border: `1px solid ${soft(c, forte ? 55 : 24)}`,
+      color: c, fontFamily: F_UI, fontWeight: 700,
+      fontSize: Math.round(tamanho * 0.37), letterSpacing: "0.02em",
+    }}>{iniciais(nome)}</span>
+  );
+}
+
+/* Barra fina, usada tanto no pódio quanto na linha do ranking. */
+function Barra({ fracao, cor, altura = 4 }) {
+  return (
+    <span style={{
+      display: "block", height: altura, borderRadius: 99,
+      background: soft(cor, 12), overflow: "hidden",
+    }}>
+      <span style={{
+        display: "block", height: "100%", borderRadius: 99,
+        width: `${Math.max(2, Math.min(100, Math.round(fracao * 100)))}%`,
+        background: `linear-gradient(90deg, ${soft(cor, 40)}, ${cor})`,
+      }} />
+    </span>
+  );
+}
+
+/* Os três primeiros, em destaque.
+ *
+ * Em ordem mesmo, 1º, 2º, 3º: o pódio de verdade põe o campeão no meio, mas
+ * na tela isso só funciona enquanto os três couberem lado a lado, e no
+ * celular a leitura vira 2º, 1º, 3º de cima para baixo, que é errado. Quem
+ * marca o campeão aqui é o ouro e o tamanho, não a posição. */
+function Podio({ linhas }) {
+  const tres = linhas.filter((x) => !x.oculto).slice(0, 3);
+  if (tres.length < 3) return null;
+  const teto = tres[0].minutos || 1;
+  return (
+    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mt-5">
+      {tres.map((x) => {
+        const cor = MEDALHA[x.posicao - 1];
+        const primeiro = x.posicao === 1;
+        return (
+          <div key={x.uid} className="rounded-2xl px-4 py-4"
+            style={{
+              background: primeiro
+                ? `linear-gradient(160deg, ${soft(cor, 16)}, ${soft(cor, 4)})`
+                : T.card2,
+              border: `1px solid ${soft(cor, primeiro ? 45 : 18)}`,
+            }}>
+            <div className="flex items-center gap-3">
+              <Face nome={x.nome} cor={cor} tamanho={primeiro ? 46 : 38} forte={primeiro} />
+              <span className="flex-1 min-w-0">
+                <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+                  <Num size={primeiro ? 20 : 17} color={cor} weight={700}>{x.posicao}º</Num>
+                  {x.souEu ? (
+                    <span style={{
+                      fontSize: 10.5, fontWeight: 700, color: "var(--neon)",
+                      background: soft("var(--neon)", 16), padding: "1px 7px", borderRadius: 99,
+                    }}>você</span>
+                  ) : null}
+                </div>
+                <div style={{
+                  fontSize: primeiro ? 15 : 14, fontWeight: 600, color: T.ink, marginTop: 2,
+                  overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                }}>{x.nome}</div>
+              </span>
+            </div>
+            <div className="mt-3">
+              <Barra fracao={x.minutos / teto} cor={cor} altura={primeiro ? 5 : 4} />
+            </div>
+            <div className="mt-2 flex items-center justify-between gap-2">
+              <Num size={primeiro ? 19 : 16} weight={700}>{fmtMin(x.minutos)}</Num>
+              <Mini>{x.pct === null ? "sem questões" : `${x.pct}% de acerto`}</Mini>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ── o seu dia ─────────────────────────────────────────────────────────
+ *
+ * Sai das próprias sessões gravadas, e não do servidor: é o mesmo número
+ * que a aba Hoje mostra, aparece na hora e continua certo mesmo sem rede.
+ * Fica no alto da aba porque é a resposta da pergunta que faz alguém abrir
+ * a sala de manhã, que é "eu já fiz alguma coisa hoje". */
+function MeuDia({ data, hoje, minhaLinha, rotuloSala }) {
+  const soma = useMemo(() => {
+    const s = { min: 0, q: 0, ok: 0 };
+    for (const x of data.sessions || []) {
+      if (!x || String(x.date || "") !== hoje) continue;
+      const q = Math.max(0, Number(x.questions) || 0);
+      s.min += Math.max(0, Number(x.minutes) || 0);
+      s.q += q;
+      s.ok += Math.min(q, Math.max(0, Number(x.correct) || 0));
+    }
+    return s;
+  }, [data.sessions, hoje]);
+
+  const meta = Math.max(1, Number(data.goals.daily) || 0);
+  const fracao = soma.min / meta;
+  const pct = soma.q ? Math.round((soma.ok / soma.q) * 100) : null;
+  const bateu = soma.min >= meta;
+  const cor = bateu ? "var(--ok)" : soma.min > 0 ? "var(--neon)" : T.ghost;
+
+  return (
+    <Card className="px-6 py-5" brilho={bateu ? "var(--ok)" : "var(--neon)"}>
+      <div className="flex items-center justify-between gap-3" style={{ flexWrap: "wrap" }}>
+        <H size={18} color={cor} icon={<Flame size={15} />}>O seu dia</H>
+        <Mini>
+          {bateu ? "meta do dia batida" : `meta de ${fmtMin(meta)}, faltam ${fmtMin(Math.max(0, meta - soma.min))}`}
+        </Mini>
+      </div>
+
+      <div className="mt-4">
+        <Barra fracao={fracao} cor={cor} altura={6} />
+      </div>
+
+      <div className="mt-4 flex gap-x-8 gap-y-3" style={{ flexWrap: "wrap" }}>
+        <div>
+          <Num size={26} color={cor}>{fmtMin(soma.min)}</Num>
+          <Mini style={{ marginTop: 3 }}>estudadas hoje</Mini>
+        </div>
+        <div>
+          <Num size={26}>{soma.q}</Num>
+          <Mini style={{ marginTop: 3 }}>questões hoje</Mini>
+        </div>
+        <div>
+          <Num size={26} color={pct === null ? T.ghost : pct >= 70 ? T.ok : pct >= 50 ? T.warn : T.bad}>
+            {pct === null ? "—" : `${pct}%`}
+          </Num>
+          <Mini style={{ marginTop: 3 }}>acerto de hoje</Mini>
+        </div>
+        {minhaLinha ? (
+          <div>
+            <Num size={26} color="var(--warn)">{minhaLinha.posicao ? `${minhaLinha.posicao}º` : "—"}</Num>
+            <Mini style={{ marginTop: 3 }}>{rotuloSala}</Mini>
+          </div>
+        ) : null}
+      </div>
+    </Card>
+  );
+}
+
+/* Quem está com o cronômetro andando neste instante.
+ *
+ * O tempo aqui é o do bloco em andamento, e ele não entra no ranking: entra
+ * quando a sessão termina e é lançada. Somar antes contaria o mesmo tempo
+ * duas vezes enquanto o cronômetro anda. */
+function Estudando({ minutos }) {
+  return (
+    <span className="inline-flex items-center gap-1.5"
+      style={{
+        fontSize: 11, fontWeight: 700, color: "var(--ok)",
+        background: soft("var(--ok)", 15), padding: "2px 9px 2px 7px", borderRadius: 99,
+      }}>
+      <span className="aovivo" style={{
+        width: 6, height: 6, borderRadius: 99, background: "var(--ok)", display: "inline-block",
+      }} />
+      estudando {minutos > 0 ? `· ${fmtMin(minutos)}` : "agora"}
+    </span>
+  );
+}
+
+/* Uma linha do ranking.
+ *
+ * A barra atrás do nome é o tempo desta pessoa em relação ao primeiro
+ * colocado. É o que transforma uma lista de números numa corrida que dá
+ * para ler de relance, sem comparar minuto com minuto na cabeça.
+ *
+ * O "hoje" na ponta aparece mesmo quando o recorte escolhido é a semana ou
+ * o mês: quem lidera o mês pode não ter aberto o livro hoje, e é essa a
+ * informação que muda o que a pessoa faz agora. */
+function LinhaRanking({ x, teto, mostrarHoje }) {
+  const medalha = !x.oculto && x.posicao <= 3;
+  const cor = x.oculto ? T.ghost : medalha ? MEDALHA[x.posicao - 1] : corDoNome(x.nome);
+  const fracao = !x.oculto && teto > 0 ? x.minutos / teto : 0;
+
+  return (
+    <div className="rounded-2xl"
+      style={{
+        position: "relative", overflow: "hidden",
+        background: x.souEu ? soft("var(--neon)", 10) : T.card2,
+        border: `1px solid ${x.souEu ? soft("var(--neon)", 34) : "transparent"}`,
+      }}>
+      {/* o tempo desta pessoa, pintado atrás do conteúdo */}
+      {fracao > 0 ? (
+        <span aria-hidden="true" style={{
+          position: "absolute", left: 0, top: 0, bottom: 0,
+          width: `${Math.max(1.5, Math.min(100, fracao * 100))}%`,
+          background: `linear-gradient(90deg, ${soft(cor, 13)}, ${soft(cor, 3)})`,
+          pointerEvents: "none",
+        }} />
+      ) : null}
+
+      {/* No celular o nome fica numa linha e os números na de baixo: lado a
+          lado, os três números espremiam o nome até virar "A..". */}
+      <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-3 px-4 py-3.5"
+        style={{ position: "relative" }}>
+        <div className="flex items-center gap-3 flex-1 min-w-0">
+          <span className="flex items-center justify-center" style={{
+            width: 22, flexShrink: 0,
+            fontFamily: F_MONO, fontSize: 13, fontWeight: 700,
+            color: x.oculto ? T.ghost : cor,
+          }}>{x.oculto ? "—" : x.posicao}</span>
+
+          <Face nome={x.nome} cor={x.oculto ? T.ghost : cor} tamanho={34} forte={medalha} />
+
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
+              <span style={{
+                fontSize: 15, fontWeight: 600, color: T.ink,
+                overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220,
+              }}>{x.nome}</span>
+              {x.souEu ? (
+                <span style={{
+                  fontSize: 11, fontWeight: 700, color: "var(--neon)",
+                  background: soft("var(--neon)", 16), padding: "2px 8px", borderRadius: 99,
+                }}>você</span>
+              ) : null}
+              {x.estudando ? <Estudando minutos={x.agoraMin} /> : null}
+              {x.dono ? <Mini>criou a sala</Mini> : null}
+            </div>
+            <Mini style={{ marginTop: 3 }}>
+              {x.oculto ? "escolheu não mostrar o desempenho"
+                : x.questoes ? `${x.acertos} de ${x.questoes} questões` : "sem questões lançadas"}
+              {x.oculto ? "" : !x.atualizadoEm ? " · ainda não sincronizou"
+                : x.foraDoRecorte ? " · não abriu o app neste período" : ""}
+            </Mini>
+          </div>
+        </div>
+
+        {x.oculto ? (
+          <span style={{ flexShrink: 0, color: T.ghost, display: "inline-flex" }}>
+            <Lock size={15} />
+          </span>
+        ) : (
+          <div className="flex items-center justify-end gap-4" style={{ flexShrink: 0 }}>
+            {mostrarHoje ? (
+              <div className="text-right">
+                <Num size={15} weight={700} color={x.hoje && x.hoje.minutos ? T.ok : T.ghost}>
+                  {x.hoje && x.hoje.minutos ? fmtMin(x.hoje.minutos) : "—"}
+                </Num>
+                <Mini>hoje</Mini>
+              </div>
+            ) : null}
+            <div className="text-right">
+              <Num size={17} weight={700}>{fmtMin(x.minutos)}</Num>
+              <Mini>líquidas</Mini>
+            </div>
+            <div className="text-right" style={{ minWidth: 52 }}>
+              <Num size={17} weight={700} color={x.pct === null ? T.ghost : x.pct >= 70 ? T.ok : x.pct >= 50 ? T.warn : T.bad}>
+                {x.pct === null ? "—" : `${x.pct}%`}
+              </Num>
+              <Mini>acerto</Mini>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* Hora curta para a conversa: "14:32" quando é de hoje, com o dia junto
+   quando é de outro dia. */
+function horaCurta(em) {
+  const d = new Date(em || 0);
+  if (!em || Number.isNaN(d.getTime())) return "";
+  const hora = d.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" });
+  const hoje = new Date();
+  const mesmoDia = d.toDateString() === hoje.toDateString();
+  return mesmoDia ? hora : `${d.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" })} ${hora}`;
+}
+
+/* ── estudar juntos ────────────────────────────────────────────────────
+ *
+ * Duas coisas pequenas que, juntas, fazem a sala virar mesa de estudo:
+ *
+ * 1. Um foco combinado. Alguém marca 25, 50 ou 90 minutos e a sala inteira
+ *    vê o mesmo relógio correndo. O que faz estudar junto funcionar é
+ *    começar e parar na mesma hora — não é chamada de vídeo, não é ver a
+ *    cara do outro. O relógio termina sozinho quando o tempo acaba, porque
+ *    fechar a aba não avisa ninguém.
+ *
+ * 2. A Jam do Spotify. E aqui a verdade importa: o Spotify NÃO tem API
+ *    pública para criar ou entrar numa Jam. Quem cria é o app do Spotify,
+ *    no aparelho de quem começou. O que o site faz é guardar o link para a
+ *    sala inteira abrir o mesmo — e só aceita endereço do próprio Spotify,
+ *    senão o campo viraria um jeito de mandar qualquer link para todo
+ *    mundo de uma vez.
+ */
+/* Os tempos de um toque, e os limites do campo livre. Precisam bater com o
+   que a rota aceita (5 minutos a 12 horas): aqui é só para a tela não
+   prometer o que o servidor vai recusar. */
+const TEMPOS_JUNTOS = [25, 50, 90, 120, 180, 240];
+const MIN_FOCO_JUNTOS = 5;
+const MAX_FOCO_JUNTOS = 720;
+
+function EstudarJuntos({ nuvem, slug, foco, jam, estudando, aoMudar, notify, irPara }) {
+  const [ocupado, setOcupado] = useState("");
+  const [link, setLink] = useState("");
+  const [erro, setErro] = useState("");
+  const [agora, setAgora] = useState(Date.now());
+  /* Campo livre, para quem quer um tempo que não está nos botões. Fica em
+     minutos porque é a unidade que o servidor recebe, mas a tela mostra a
+     tradução em horas enquanto a pessoa escreve. */
+  const [outro, setOutro] = useState("");
+
+  /* O relógio anda aqui, e não no servidor: o ranking só recarrega de
+     tempos em tempos, e um contador que só mexesse nessa hora andaria aos
+     pulos de meio minuto. */
+  const fim = foco ? foco.inicio + foco.minutos * 60000 : 0;
+  const resta = fim ? Math.max(0, Math.ceil((fim - agora) / 1000)) : 0;
+  useEffect(() => {
+    if (!fim) return undefined;
+    const t = window.setInterval(() => setAgora(Date.now()), 500);
+    return () => window.clearInterval(t);
+  }, [fim]);
+
+  const mandar = async (corpo, oQue) => {
+    setOcupado(oQue); setErro("");
+    const j = await falarComSalas(nuvem, { ...corpo, nome: slug });
+    setOcupado("");
+    if (j.erro) { setErro(j.erro); return null; }
+    aoMudar(j);
+    return j;
+  };
+
+  const combinar = async (minutos) => {
+    const j = await mandar({ acao: "focar", minutos }, "foco");
+    if (j) { setOutro(""); notify(`Foco de ${fmtMin(minutos)} combinado com a sala.`); }
+  };
+
+  /* O que a pessoa escreveu, já limpo. Zero significa "ainda não dá para
+     combinar", e é isso que desliga o botão. */
+  const escrito = Math.round(Number(outro) || 0);
+  const escritoVale = escrito >= MIN_FOCO_JUNTOS && escrito <= MAX_FOCO_JUNTOS;
+
+  return (
+    <Card className="px-6 py-6" brilho="var(--neon)">
+      <H color="var(--neon)" icon={<Users size={16} />}>Estudar juntos</H>
+
+      {foco && resta > 0 ? (
+        <div className="mt-4 rounded-2xl px-4 py-4"
+          style={{ background: soft("var(--neon)", 12), border: `1px solid ${soft("var(--neon)", 30)}` }}>
+          <div className="flex items-center gap-3 flex-wrap">
+            <span style={{ fontFamily: F_MONO, fontSize: 30, fontWeight: 600, color: T.neon }}>
+              {fmtRelogio(resta)}
+            </span>
+            <span className="flex-1 min-w-0">
+              <Mini>
+                foco de {foco.minutos} min{foco.por ? `, combinado por ${foco.por}` : ""}
+                {estudando ? ` · ${estudando} estudando agora` : ""}
+              </Mini>
+            </span>
+          </div>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {irPara ? <Btn size="sm" tone="primary" onClick={() => irPara("foco")}>abrir o meu Foco</Btn> : null}
+            <Btn size="sm" tone="outline" disabled={ocupado === "foco"}
+              onClick={() => mandar({ acao: "focar", minutos: 0 }, "foco")}>encerrar para a sala</Btn>
+          </div>
+        </div>
+      ) : (
+        <>
+          <Texto style={{ marginTop: 10 }}>
+            Marque um tempo e todo mundo da sala vê o mesmo relógio. Começar e parar
+            na mesma hora é o que faz estudar junto valer, mesmo cada um na sua casa.
+          </Texto>
+          <div className="mt-4 flex flex-wrap gap-2">
+            {TEMPOS_JUNTOS.map((m) => (
+              <Btn key={m} size="sm" tone={m === 50 ? "primary" : "quiet"} disabled={ocupado === "foco"}
+                onClick={() => combinar(m)}>{fmtMin(m)}</Btn>
+            ))}
+          </div>
+
+          <div className="mt-3 flex items-end gap-2 flex-wrap">
+            <div style={{ width: 128 }}>
+              <Field label="Outro tempo">
+                <TextInput type="number" inputMode="numeric" value={outro}
+                  min={MIN_FOCO_JUNTOS} max={MAX_FOCO_JUNTOS} placeholder="minutos"
+                  onChange={(e) => setOutro(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === "Enter" && escritoVale) combinar(escrito); }} />
+              </Field>
+            </div>
+            <Btn size="sm" tone="outline" disabled={ocupado === "foco" || !escritoVale}
+              onClick={() => combinar(escrito)}>combinar</Btn>
+            <Mini style={{ paddingBottom: 10 }}>
+              {escrito > 0 && !escritoVale
+                ? `de ${MIN_FOCO_JUNTOS} min a ${MAX_FOCO_JUNTOS / 60} horas`
+                : escrito > 0 ? fmtMin(escrito) : "em minutos · até 12 horas"}
+            </Mini>
+          </div>
+        </>
+      )}
+
+      <div className="mt-5 pt-5" style={{ borderTop: `1px solid ${T.line}` }}>
+        <Label>Ouvir junto</Label>
+        {jam ? (
+          <div className="mt-3 flex items-center gap-2 flex-wrap">
+            <a href={jam.url} target="_blank" rel="noopener noreferrer"
+              className="inline-flex items-center justify-center gap-2 rounded-full toque"
+              style={{
+                background: T.ink, color: T.bg2, border: "1px solid transparent",
+                padding: "7px 14px", fontSize: 14, fontWeight: 600, textDecoration: "none",
+              }}>
+              <Music size={14} /> Abrir no Spotify
+            </a>
+            <Mini>{jam.por ? `posto por ${jam.por}` : ""}</Mini>
+            <Btn size="sm" tone="outline" disabled={ocupado === "jam"}
+              onClick={() => mandar({ acao: "jam", url: "" }, "jam")}>tirar</Btn>
+          </div>
+        ) : (
+          <>
+            <Mini style={{ marginTop: 6, lineHeight: 1.6 }}>
+              Comece a Jam no aplicativo do Spotify, toque em compartilhar e cole o
+              link aqui. A Jam é do Spotify: nenhum site consegue criar uma por
+              fora, então o que dá para fazer é a sala abrir o mesmo link.
+            </Mini>
+            <div className="mt-3 flex items-center gap-2 flex-wrap">
+              <TextInput style={{ flex: 1, minWidth: 200 }} value={link}
+                placeholder="https://open.spotify.com/..."
+                onChange={(e) => setLink(e.target.value)} />
+              <Btn size="sm" tone="primary" disabled={!link.trim() || ocupado === "jam"}
+                onClick={async () => {
+                  const j = await mandar({ acao: "jam", url: link.trim() }, "jam");
+                  if (j) { setLink(""); notify("Link da Jam combinado com a sala."); }
+                }}>combinar</Btn>
+            </div>
+          </>
+        )}
+      </div>
+      {erro ? <Label style={{ marginTop: 12, color: T.bad }}>{erro}</Label> : null}
+    </Card>
+  );
+}
+
+/* Os recados da sala.
+ *
+ * Vai e volta pelo servidor, como o resto: pelas regras do Firestore o
+ * navegador não abre a sala nem para ler. Quem não é da sala não recebe
+ * nada — quem confere é a rota, que já sabe quem está pedindo. */
+function Recados({ nuvem, slug, quem }) {
+  const [itens, setItens] = useState(null);
+  const [texto, setTexto] = useState("");
+  const [enviando, setEnviando] = useState(false);
+  const [erro, setErro] = useState("");
+  const lista = useRef(null);
+  const refNuvem = useRef(nuvem);
+  refNuvem.current = nuvem;
+
+  const buscar = useCallback(async () => {
+    if (!slug) return;
+    const j = await falarComSalas(refNuvem.current, { acao: "recados", nome: slug });
+    if (j.erro) return;                        // silencioso: é atualização de fundo
+    /* Só troca a lista quando a conversa mudou de verdade.
+     *
+     * A busca roda a cada doze segundos e devolvia sempre um array novo,
+     * mesmo sem mensagem nova. Como a identidade mudava, tudo que dependia
+     * dela reagia — inclusive o efeito que descia a conversa, que puxava a
+     * página junto no celular a cada doze segundos, do nada. */
+    const novos = j.recados || [];
+    setItens((antes) => (
+      antes && JSON.stringify(antes) === JSON.stringify(novos) ? antes : novos
+    ));
+  }, [slug]);
+
+  useEffect(() => {
+    setItens(null);
+    buscar();
+    /* Em segundo plano ninguém está lendo, e continuar perguntando seria
+       conversa com o servidor à toa — e bateria do celular. */
+    const t = setInterval(() => {
+      if (!document.hidden) buscar();
+    }, RITMO_RECADOS);
+    const aoVoltar = () => { if (!document.hidden) buscar(); };
+    document.addEventListener("visibilitychange", aoVoltar);
+    return () => { clearInterval(t); document.removeEventListener("visibilitychange", aoVoltar); };
+  }, [buscar]);
+
+  /* Desce até a última mensagem quando chega coisa nova.
+   *
+   * Mexendo no scroll da própria caixa, e não com scrollIntoView: aquele
+   * também rola os pais até o elemento aparecer, e no celular isso jogava a
+   * PÁGINA inteira para baixo, tirando da tela o que a pessoa estava lendo.
+   *
+   * E só desce quem já estava embaixo. Quem subiu para reler uma mensagem
+   * antiga fica onde está: puxar a tela de volta no meio da leitura é pior
+   * do que perder a mensagem nova de vista. */
+  useEffect(() => {
+    const caixa = lista.current;
+    if (!caixa || !itens) return;
+    const distancia = caixa.scrollHeight - caixa.scrollTop - caixa.clientHeight;
+    if (distancia > 120) return;
+    caixa.scrollTop = caixa.scrollHeight;
+  }, [itens]);
+
+  const mandar = async () => {
+    const escrito = texto.trim();
+    if (!escrito || enviando) return;
+    setEnviando(true); setErro("");
+    const j = await falarComSalas(refNuvem.current, { acao: "dizer", nome: slug, texto: escrito });
+    setEnviando(false);
+    if (j.erro) { setErro(j.erro); return; }
+    setTexto("");
+    setItens(j.recados || []);
+  };
+
+  return (
+    <Card className="px-6 py-6">
+      <H color="var(--neon2)" icon={<MessageCircle size={16} />}>Recados da sala</H>
+
+      <div ref={lista} className="mt-4 flex flex-col gap-3" style={{
+        maxHeight: 340, overflowY: "auto", overflowX: "hidden",
+        /* A rolagem para aqui em vez de continuar na página: sem isto, no
+           celular, chegar ao fim da conversa emendava em rolar o site. */
+        overscrollBehavior: "contain",
+      }}>
+        {itens === null ? (
+          <Label>carregando…</Label>
+        ) : itens.length === 0 ? (
+          <Mini>Nenhum recado ainda. Combine o horário, conte como foi o dia.</Mini>
+        ) : itens.map((m, i) => {
+          const meu = m.uid === quem;
+          return (
+            <div key={`${m.em}-${i}`} className="flex flex-col"
+              style={{ alignItems: meu ? "flex-end" : "flex-start" }}>
+              <div className="rounded-2xl px-3.5 py-2.5" style={{
+                maxWidth: "86%",
+                background: meu ? soft("var(--neon)", 12) : T.card2,
+                border: `1px solid ${meu ? soft("var(--neon)", 26) : T.line}`,
+              }}>
+                {meu ? null : (
+                  <div style={{ fontSize: 12, fontWeight: 700, color: T.dim, marginBottom: 3 }}>
+                    {m.nome}
+                  </div>
+                )}
+                <div style={{
+                  fontSize: 14.5, color: T.ink, lineHeight: 1.5,
+                  overflowWrap: "anywhere", whiteSpace: "pre-wrap",
+                }}>{m.texto}</div>
+              </div>
+              <Mini style={{ marginTop: 3 }}>{horaCurta(m.em)}</Mini>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-4 flex gap-2 items-end">
+        <div className="flex-1 min-w-0">
+          <TextInput value={texto} placeholder="escreva um recado"
+            maxLength={MAX_RECADO}
+            onChange={(e) => setTexto(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") mandar(); }} />
+        </div>
+        <Btn tone="primary" onClick={mandar} disabled={enviando || !texto.trim()}>
+          {enviando ? "…" : <Send size={15} />}
+        </Btn>
+      </div>
+
+      {erro ? <span style={{ fontSize: 14, color: T.bad }}>{erro}</span> : null}
+      <Mini style={{ marginTop: 10 }}>
+        Fica só para quem está na sala, e a sala guarda os {MAX_RECADO_ITENS} últimos
+        recados. Atualiza sozinho a cada {Math.round(RITMO_RECADOS / 1000)} segundos.
+      </Mini>
+    </Card>
+  );
+}
+
+function Amigos({ nuvem, notify, data, setData, irPara }) {
+  const [salas, setSalas] = useState(null);
+  const [atual, setAtual] = useState(null);        // slug escolhido
+  const [ranking, setRanking] = useState(null);
+  const [cabecalho, setCabecalho] = useState(null);
+  const [juntos, setJuntos] = useState({ foco: null, jam: null });
+  const [form, setForm] = useState({ nome: "", senha: "" });
+  const [modo, setModo] = useState("entrar");      // entrar | criar
+  /* A semana é a corrida que interessa: dá para virar o jogo. O mês e o
+     total ficam a um toque, para quem quer ver o acumulado. */
+  const [periodo, setPeriodo] = useState("semana");
+  const [ocupado, setOcupado] = useState(false);
+  const [erro, setErro] = useState("");
+  const estudandoAgora = (ranking || []).filter((x) => x.estudando).length;
+  const hoje = todayISO();
+  /* O primeiro colocado é a régua da barra de cada linha. Só entra quem
+     mostra o desempenho: quem esconde publica zero, e não seria régua de
+     nada. */
+  const teto = Math.max(0, ...(ranking || []).filter((x) => !x.oculto).map((x) => x.minutos));
+  const minhaLinha = (ranking || []).find((x) => x.souEu) || null;
+
+  const logado = !!(nuvem && nuvem.usuario);
+  /* O objeto da nuvem entra por referência, e não como dependência: quem
+     manda no recarregamento é quem está logado. Se um dia esse objeto voltar
+     a nascer novo a cada render, isto impede que o efeito dispare em laço —
+     foi assim que a aba começou a se recarregar sozinha sem parar. */
+  const refNuvem = useRef(nuvem);
+  refNuvem.current = nuvem;
+  const quem = nuvem && nuvem.usuario ? nuvem.usuario.uid : "";
+
+  const carregarSalas = useCallback(async () => {
+    if (!quem) return;
+    const j = await falarComSalas(refNuvem.current, { acao: "minhas" });
+    if (j.erro) { setErro(j.erro); return; }
+    setSalas(j.salas || []);
+    /* Primeira sala vira a escolhida, senão a aba abre vazia mesmo para
+       quem já participa de alguma. */
+    setAtual((p) => (p || (j.salas && j.salas[0] ? j.salas[0].slug : null)));
+  }, [quem]);
+
+  useEffect(() => { carregarSalas(); }, [carregarSalas]);
+
+  const carregarRanking = useCallback(async (slug, silencioso) => {
+    if (!slug) return;
+    if (!silencioso) setOcupado(true);
+    const j = await falarComSalas(refNuvem.current, { acao: "ranking", nome: slug, periodo });
+    if (!silencioso) setOcupado(false);
+    if (j.erro) { if (!silencioso) setErro(j.erro); return; }
+    setRanking(j.ranking || []);
+    setCabecalho(j.sala || null);
+    setJuntos({ foco: j.foco || null, jam: j.jam || null });
+    setErro("");
+  }, [periodo]);
+
+  useEffect(() => {
+    if (!atual) { setRanking(null); setCabecalho(null); setJuntos({ foco: null, jam: null }); return undefined; }
+    carregarRanking(atual);
+    const t = setInterval(() => carregarRanking(atual, true), RITMO_RANKING);
+    return () => clearInterval(t);
+  }, [atual, carregarRanking]);
+
+  const enviar = async () => {
+    if (!form.nome.trim()) { setErro("Escreva o nome da sala."); return; }
+    if (form.senha.length < 4) { setErro("A senha precisa ter pelo menos 4 caracteres."); return; }
+    setOcupado(true); setErro("");
+    const j = await falarComSalas(refNuvem.current, { acao: modo, nome: form.nome.trim(), senha: form.senha });
+    setOcupado(false);
+    if (j.erro) { setErro(j.erro); return; }
+    notify(j.mensagem || "Pronto.");
+    setForm({ nome: "", senha: "" });
+    setAtual(j.slug);
+    await carregarSalas();
+  };
+
+  const sair = async () => {
+    if (!atual) return;
+    setOcupado(true);
+    const j = await falarComSalas(refNuvem.current, { acao: "sair", nome: atual });
+    setOcupado(false);
+    if (j.erro) { setErro(j.erro); return; }
+    notify(j.mensagem || "Você saiu da sala.");
+    setAtual(null); setRanking(null); setCabecalho(null);
+    setSalas(null);
+    await carregarSalas();
+  };
+
+  if (!logado) {
+    return (
+      <Card className="px-6 sm:px-10 py-12 text-center" brilho="var(--neon2)">
+        <div className="flex justify-center" style={{ color: "var(--neon2)" }}>
+          <span className="flex items-center justify-center rounded-full"
+            style={{ width: 56, height: 56, background: soft("var(--neon2)", 16) }}>
+            <Users size={24} />
+          </span>
+        </div>
+        <h2 style={{ fontFamily: F_SERIF, fontSize: 24, fontWeight: 400, margin: "18px 0 0", color: T.ink }}>
+          Estudar acompanhado
+        </h2>
+        <p style={{ color: T.dim, fontSize: 15, lineHeight: 1.65, marginTop: 10, maxWidth: 430, marginLeft: "auto", marginRight: "auto" }}>
+          Crie uma conta em Configurações para montar salas com seus amigos e comparar
+          horas estudadas, questões e acerto.
+        </p>
+      </Card>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-5">
+      <MeuDia data={data} hoje={hoje} minhaLinha={minhaLinha}
+        rotuloSala={cabecalho && cabecalho.rotulo ? `na sala, ${cabecalho.rotulo}` : "na sala"} />
+
+      <Card className="px-6 py-6" brilho="var(--neon2)">
+        <H color="var(--neon2)" icon={<Users size={16} />}>Salas de amigos</H>
+        <Texto style={{ marginTop: 10 }}>
+          Combine um nome e uma senha com quem você estuda. Todo mundo que entrar
+          com os dois vê o mesmo ranking, feito com as horas líquidas, as questões
+          e o acerto que cada um já lançou aqui.
+        </Texto>
+
+        <label className="mt-4 flex items-start gap-2.5" style={{ cursor: "pointer" }}>
+          <input type="checkbox" checked={data.mostrarDesempenho !== false}
+            style={{ marginTop: 2 }}
+            onChange={(e) => setData((p) => ({ ...p, mostrarDesempenho: e.target.checked }))} />
+          <span style={{ fontSize: 13.5, color: T.dim, lineHeight: 1.55 }}>
+            Mostrar meu desempenho no ranking
+            <span style={{ color: T.ghost }}>
+              {" · "}desligado, você continua nas salas e vê o de todo mundo, mas
+              seus números param de ser enviados
+            </span>
+          </span>
+        </label>
+
+        {salas && salas.length ? (
+          <div className="mt-5 flex gap-2 flex-wrap">
+            {salas.map((s) => {
+              const on = atual === s.slug;
+              return (
+                <button key={s.slug} type="button" onClick={() => setAtual(s.slug)}
+                  className="flex items-center gap-2.5 rounded-full brilhar"
+                  style={{
+                    padding: "5px 14px 5px 5px",
+                    background: on
+                      ? `linear-gradient(140deg, ${soft("var(--neon2)", 22)}, ${soft("var(--neon2)", 8)})`
+                      : T.card,
+                    border: `1px solid ${on ? soft("var(--neon2)", 40) : T.line}`,
+                    color: on ? "var(--neon2)" : T.dim,
+                    fontSize: 14, fontWeight: on ? 700 : 500, cursor: "pointer",
+                  }}>
+                  <Face nome={s.nome} cor={on ? "var(--neon2)" : T.dim} tamanho={26} forte={on} />
+                  {s.nome}
+                  <span style={{
+                    fontFamily: F_MONO, fontSize: 11.5, fontWeight: 700,
+                    color: on ? "var(--neon2)" : T.ghost,
+                    background: soft(on ? "var(--neon2)" : "var(--ink)", 12),
+                    padding: "1px 7px", borderRadius: 99,
+                  }}>{s.membros}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
+
+        <div className="mt-6 pt-5" style={{ borderTop: `1px solid ${T.line}` }}>
+          <div className="flex gap-2 flex-wrap">
+            {[["entrar", "Entrar numa sala"], ["criar", "Criar uma sala"]].map(([id, lb]) => (
+              <button key={id} type="button" onClick={() => { setModo(id); setErro(""); }}
+                className="rounded-full px-4 py-2"
+                style={{
+                  background: modo === id ? T.card3 : "transparent",
+                  border: `1px solid ${modo === id ? "transparent" : T.line}`,
+                  color: modo === id ? T.ink : T.dim,
+                  fontSize: 14, fontWeight: modo === id ? 700 : 500, cursor: "pointer",
+                }}>{lb}</button>
+            ))}
+          </div>
+
+          <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <Field label="Nome da sala">
+              <TextInput value={form.nome} placeholder="Ex.: plantão da madrugada"
+                onChange={(e) => setForm((p) => ({ ...p, nome: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === "Enter") enviar(); }} />
+            </Field>
+            <Field label="Senha">
+              <TextInput type="password" value={form.senha} placeholder="pelo menos 4 caracteres"
+                autoComplete={modo === "criar" ? "new-password" : "current-password"}
+                onChange={(e) => setForm((p) => ({ ...p, senha: e.target.value }))}
+                onKeyDown={(e) => { if (e.key === "Enter") enviar(); }} />
+            </Field>
+          </div>
+
+          <div className="mt-4 flex items-center gap-3 flex-wrap">
+            <Btn tone="primary" onClick={enviar} disabled={ocupado}>
+              {ocupado ? "Aguarde…" : modo === "criar" ? "Criar sala" : "Entrar"}
+            </Btn>
+            <Mini style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+              <Lock size={12} /> a senha é conferida no servidor
+            </Mini>
+            {erro ? <span style={{ fontSize: 14, color: T.bad }}>{erro}</span> : null}
+          </div>
+        </div>
+      </Card>
+
+      {atual && ranking ? (
+        <Card className="px-6 py-6">
+          <div className="flex items-center justify-between gap-3 flex-wrap">
+            <H color="var(--warn)" icon={<Trophy size={16} />}>
+              {cabecalho ? cabecalho.nome : "Ranking"}
+            </H>
+            <div className="flex items-center gap-2">
+              <Btn size="sm" tone="outline" onClick={() => carregarRanking(atual)} disabled={ocupado}>
+                <RefreshCw size={14} /> atualizar
+              </Btn>
+              <Btn size="sm" tone="danger" onClick={sair} disabled={ocupado}>sair da sala</Btn>
+            </div>
+          </div>
+
+          <div className="mt-4 flex gap-2 flex-wrap items-center">
+            <div className="flex rounded-full" style={{ background: T.card2, padding: 3, border: `1px solid ${T.line}` }}>
+              {PERIODOS.map(([id, lb]) => (
+                <button key={id} type="button" onClick={() => setPeriodo(id)}
+                  className="toque-larg rounded-full px-4 py-1.5"
+                  style={{
+                    background: periodo === id ? soft("var(--warn)", 20) : "transparent",
+                    border: "none", color: periodo === id ? "var(--warn)" : T.dim,
+                    fontSize: 13.5, fontWeight: periodo === id ? 700 : 500, cursor: "pointer",
+                  }}>{lb}</button>
+              ))}
+            </div>
+            {cabecalho && cabecalho.rotulo ? <Mini>{cabecalho.rotulo}</Mini> : null}
+          </div>
+
+          <Mini style={{ marginTop: 10 }}>
+            {ranking.length} {ranking.length === 1 ? "pessoa" : "pessoas"}
+            {estudandoAgora ? ` · ${estudandoAgora} estudando agora` : ""}
+            {" · "}ordenado por horas líquidas · atualiza sozinho a cada {Math.round(RITMO_RANKING / 1000)} segundos
+          </Mini>
+
+          {ranking.length === 0 ? (
+            <Blank icon={<Users size={26} />} title="Sala vazia"
+              hint="Passe o nome e a senha para quem estuda com você." />
+          ) : (
+            <>
+              <Podio linhas={ranking} />
+              <div className="mt-5 flex flex-col gap-2">
+                {ranking.map((x) => (
+                  <LinhaRanking key={x.uid} x={x} teto={teto} mostrarHoje={periodo !== "hoje"} />
+                ))}
+              </div>
+            </>
+          )}
+
+          <Mini style={{ marginTop: 16, lineHeight: 1.7 }}>
+            Aparecem só o nome do perfil e os três números do ranking, mais a
+            marca de quem está com o cronômetro andando agora. O que você
+            estudou, suas anotações e seus cartões não são compartilhados. Para
+            mudar o nome que os outros veem, é o nome em Configurações.
+          </Mini>
+        </Card>
+      ) : atual && ocupado ? (
+        <Card className="px-6 py-6"><Label>carregando o ranking…</Label></Card>
+      ) : null}
+
+      <Duplas nuvem={nuvem} notify={notify} />
+
+      {atual && ranking ? (
+        <EstudarJuntos nuvem={nuvem} slug={atual} foco={juntos.foco} jam={juntos.jam}
+          estudando={estudandoAgora} notify={notify} irPara={irPara}
+          aoMudar={(j) => setJuntos((p) => ({
+            foco: j.foco !== undefined ? j.foco : p.foco,
+            jam: j.jam !== undefined ? j.jam : p.jam,
+          }))} />
+      ) : null}
+      {atual && ranking ? <Recados nuvem={nuvem} slug={atual} quem={quem} /> : null}
+    </div>
+  );
+}
