@@ -1,0 +1,162 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MedMentor Scribe</title>
+  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="scribe.css" />
+</head>
+<body>
+  <header>
+    <h1>MedMentor <span class="accent">Scribe</span></h1>
+    <nav>
+      <button data-tab="consulta" class="active">Consulta</button>
+      <button data-tab="modelos">Modelos</button>
+      <button data-tab="historico">Histórico</button>
+      <button data-tab="config">Configurações</button>
+      <a class="btn" href="index.html">← Estudos</a>
+      <button id="themeToggle" title="Alternar tema">Tema</button>
+    </nav>
+  </header>
+
+  <main>
+    <!-- ============ CONSULTA ============ -->
+    <section id="consulta" class="tab">
+      <div class="two-col">
+        <div class="card">
+          <h2>1. Dados da consulta</h2>
+          <div class="row">
+            <label>Paciente (iniciais ou apelido)
+              <input id="patient" placeholder="Ex.: M.S.O." list="patientList" />
+              <datalist id="patientList"></datalist>
+            </label>
+            <label>Data
+              <input id="date" type="date" />
+            </label>
+          </div>
+          <label>Modelo
+            <select id="templateSelect"></select>
+          </label>
+
+          <div class="mode">
+            <label class="radio"><input type="radio" name="mode" value="new" checked /> Nova consulta (preencher modelo)</label>
+            <label class="radio"><input type="radio" name="mode" value="update" /> Atualizar consulta anterior</label>
+          </div>
+
+          <div id="prevBox" class="hidden">
+            <label>Consulta anterior
+              <select id="prevSelect"><option value="">— colar texto abaixo —</option></select>
+            </label>
+            <textarea id="prevText" rows="7" placeholder="Cole aqui a evolução/consulta anterior (ou escolha uma do histórico acima)."></textarea>
+            <label class="check"><input type="checkbox" id="markChanges" checked /> Marcar com ▲ o que mudou desde a consulta anterior</label>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>2. Transcrição</h2>
+          <div class="toolbar">
+            <button id="micBtn" type="button">🎙️ Ditar ao vivo</button>
+            <span id="micStatus" class="meta"></span>
+          </div>
+          <textarea id="transcript" rows="14" placeholder="Cole aqui a transcrição do áudio da consulta (de qualquer app de transcrição), ou use “Ditar ao vivo” para transcrever pelo microfone do navegador."></textarea>
+          <div class="toolbar">
+            <button id="generateBtn" class="primary" type="button">⚡ Gerar prontuário</button>
+            <span id="genStatus" class="meta"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="outputCard">
+        <div class="toolbar spread">
+          <h2>3. Prontuário gerado <span id="outMeta" class="meta"></span></h2>
+          <div class="toolbar">
+            <button id="copyAllBtn" type="button">📋 Copiar tudo</button>
+            <button id="saveBtn" type="button">💾 Salvar no histórico</button>
+          </div>
+        </div>
+        <p class="meta">Revise e edite cada caixa antes de copiar para o prontuário oficial.</p>
+        <div id="output" class="fields"><p class="meta">Nenhum prontuário gerado ainda.</p></div>
+      </div>
+    </section>
+
+    <!-- ============ MODELOS ============ -->
+    <section id="modelos" class="tab hidden">
+      <div class="two-col">
+        <div class="card">
+          <h2>Meus modelos</h2>
+          <div id="templateList" class="list"></div>
+          <button id="newTemplateBtn" type="button">+ Novo modelo em branco</button>
+        </div>
+
+        <div class="card">
+          <h2>Criar modelo a partir de um texto</h2>
+          <p class="meta">Cole seu roteiro/modelo de consulta (ex.: o modelo que você usa no hospital). O Scribe detecta os campos — linhas terminando com “:”, títulos em MAIÚSCULAS, <code>## títulos</code>, <code>[campos]</code> ou <code>{{campos}}</code> — e cria as caixinhas para você ajustar.</p>
+          <textarea id="rawTemplate" rows="12" placeholder="IDENTIFICAÇÃO:&#10;QUEIXA PRINCIPAL:&#10;HDA:&#10;ANTECEDENTES PESSOAIS: comorbidades, cirurgias, internações&#10;MEDICAÇÕES EM USO:&#10;ALERGIAS:&#10;EXAME FÍSICO: PA [ ] FC [ ] ...&#10;HIPÓTESES DIAGNÓSTICAS:&#10;CONDUTA:"></textarea>
+          <div class="toolbar">
+            <button id="parseLocalBtn" type="button">🔍 Detectar campos</button>
+            <button id="parseAiBtn" type="button">✨ Detectar com IA</button>
+            <span id="parseStatus" class="meta"></span>
+          </div>
+        </div>
+      </div>
+
+      <div class="card" id="editorCard">
+        <div class="toolbar spread">
+          <h2>Editor de modelo</h2>
+          <div class="toolbar">
+            <button id="addFieldBtn" type="button">+ Campo</button>
+            <button id="saveTemplateBtn" class="primary" type="button">💾 Salvar modelo</button>
+          </div>
+        </div>
+        <label>Nome do modelo <input id="tplName" placeholder="Ex.: Ambulatório de Clínica Médica" /></label>
+        <label>Instruções gerais (opcional)
+          <textarea id="tplInstructions" rows="2" placeholder="Ex.: Escrever em tópicos curtos, usar abreviações usuais (HAS, DM2), exame físico em linha única."></textarea>
+        </label>
+        <div id="fieldEditor" class="field-editor"><p class="meta">Selecione um modelo à esquerda, crie um novo, ou detecte a partir de um texto.</p></div>
+      </div>
+    </section>
+
+    <!-- ============ HISTÓRICO ============ -->
+    <section id="historico" class="tab hidden">
+      <div class="card">
+        <div class="toolbar spread">
+          <h2>Histórico de consultas</h2>
+          <input id="histSearch" placeholder="Buscar paciente..." />
+        </div>
+        <div id="histList" class="list"></div>
+      </div>
+    </section>
+
+    <!-- ============ CONFIG ============ -->
+    <section id="config" class="tab hidden">
+      <div class="card">
+        <h2>Inteligência artificial (Claude)</h2>
+        <p class="meta">Com uma chave da API da Anthropic o Scribe usa IA para organizar a transcrição no modelo. Sem chave, funciona no <strong>modo offline</strong> (distribui as frases por palavras‑chave — bem menos preciso). A chave fica salva só neste navegador.</p>
+        <label>Chave da API (<a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">obter chave</a>)
+          <input id="apiKey" type="password" placeholder="sk-ant-..." autocomplete="off" />
+        </label>
+        <label>Modelo de IA
+          <select id="aiModel">
+            <option value="claude-opus-5">Claude Opus 5 (mais preciso)</option>
+            <option value="claude-sonnet-5">Claude Sonnet 5 (equilíbrio)</option>
+            <option value="claude-haiku-4-5">Claude Haiku 4.5 (mais rápido/barato)</option>
+          </select>
+        </label>
+        <div class="toolbar"><button id="saveConfigBtn" class="primary" type="button">Salvar</button><span id="configStatus" class="meta"></span></div>
+      </div>
+      <div class="card warn">
+        <h3>⚠️ Privacidade (LGPD)</h3>
+        <p>Tudo é salvo apenas no seu navegador (localStorage). Ao usar a IA, a transcrição é enviada à API da Anthropic. Evite nomes completos, CPF, endereço e outros identificadores — use iniciais. O texto gerado é um rascunho: a responsabilidade pelo registro é do médico.</p>
+        <div class="toolbar">
+          <button id="exportBtn" type="button">⬇️ Exportar backup</button>
+          <label class="btn">⬆️ Importar backup <input id="importInput" type="file" accept="application/json" hidden /></label>
+          <button id="wipeBtn" type="button" class="danger">Apagar todos os dados do Scribe</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script type="module" src="scribe.js"></script>
+</body>
+</html>
