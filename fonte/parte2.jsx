@@ -1,0 +1,1073 @@
+/* ═══════════════════════════════════════════════════════════════════
+   3 · ESTADO
+   ═══════════════════════════════════════════════════════════════════ */
+
+const HABITS_SEED = [
+  { id: "h1", text: "200 questões por semana" },
+  { id: "h2", text: "Exercício 5x por semana" },
+  { id: "h3", text: "Dormir antes da meia-noite" },
+];
+
+const CORES_TIMER = [
+  ["Violeta", "#A182E6"], ["Azul", "#5F8FF2"], ["Verde", "#45C08A"],
+  ["Âmbar", "#E9A83F"], ["Laranja", "#F58A4C"], ["Rosa", "#E374A0"],
+  ["Vermelho", "#E76B7C"], ["Turquesa", "#3FBFC7"], ["Lilás", "#C77DE8"],
+  ["Grafite", "#8B8698"],
+];
+
+const DEFAULTS = {
+  /* apelido: como a pessoa quer ser chamada nas telas com outras pessoas.
+     foto: a imagem já encolhida, guardada como data URL. Ver PerfilPublico. */
+  profile: { name: PRESET ? "José Eduardo" : "", apelido: "", foto: "", examDate: "", onboarded: PRESET },
+  theme: "dark",
+  layout: "auto",
+  sessions: [], marks: {}, reviews: {}, routine: [], agenda: [], tasks: [],
+  /* Blocos da agenda já cumpridos, por "id do bloco|data". A chave leva a
+     data porque um bloco que se repete toda semana é um compromisso
+     diferente em cada segunda-feira. */
+  blocos: {},
+  goals: { daily: 120, weekly: 720, questions: 200 },
+  pomo: {
+    focus: 25, short: 5, long: 15, cycle: 4, modo: "pomodoro",
+    autoNext: true, sound: true, corFoco: "#A182E6", corPausa: "#45C08A", estilo: "anel",
+  },
+  pomoLog: [],
+  simulados: {}, provas: [], habits: HABITS_SEED, habitLog: {},
+  rever: [], notes: {},
+  googleCal: { id: "", ultima: 0, autoSync: false, autoEnviar: true, opts: {}, enviados: {} },
+  /* Academia. Fica separado de tudo que é estudo de propósito: não conta
+     hora, não entra no cronograma, não mexe em meta semanal. */
+  treino: { perfil: {}, planos: [], planoAtivo: "", emCurso: null, sessoes: [], medidas: [] },
+  /* Como o cartão de flashcard aparece na tela de estudo. */
+  cartaoEstilo: {
+    fonte: "app", tamanho: "normal", fundo: "limpo", alinhar: "centro",
+    peso: "normal", altura: "normal",
+  },
+  /* Aviso do navegador para revisão do dia e bloco que vai começar. */
+  lembretes: { ligado: false, push: { ligado: false, hora: 7 } },
+  /* Cronograma que a pessoa recebeu do curso dela, em texto, para o
+     assistente organizar a rotina em cima do que ela realmente tem.
+     As duas datas dizem quando esse período começa e quando acaba: sem elas
+     o assistente sabe o conteúdo mas não sabe o prazo. A data da prova não
+     está aqui de propósito, é a de sempre, em profile.examDate, que é quem
+     manda na projeção do painel inteiro. Ter duas seria ter duas contagens
+     regressivas discordando uma da outra. */
+  cronograma: { nome: "", texto: "", inicio: "", fim: "" },
+  /* Currículo próprio, que substitui o padrão no todo ou por área. Ver
+     normalize(), logo abaixo. */
+  cronogramaProprio: [],
+  /* Como o currículo próprio entrou: "somar" mantém as aulas da residência
+     ao lado das novas, "substituir" troca as da residência nas áreas
+     enviadas. Serve para a aba Cronograma acender de novo o cartão certo;
+     quem manda no que aparece continua sendo a lista acima. */
+  cronogramaModo: "somar",
+  /* Anotação rica por matéria (parte17.jsx), por id de aula. */
+  anotacoes: {},
+  /* O quanto cada especialidade importa PARA ESTA PESSOA, de 0 a 10.
+     Prova de residência não cobra tudo igual: cardiologia e pediatria
+     valem muito mais questão que genética médica, e a banca de cada
+     estado pesa diferente. Sem isso, "o que estudar agora" trata as 34
+     especialidades como se fossem a mesma coisa. Cinco é o neutro, e
+     especialidade sem peso declarado vale cinco. */
+  pesos: {},
+  /* Se os números desta pessoa aparecem no ranking das salas de amigos.
+     Começa ligado, que é o motivo de entrar numa sala; desligar mantém a
+     pessoa na sala, sem os números dela à mostra. */
+  mostrarDesempenho: true,
+  flash: [], pastas: [],
+  /* Ajustes de cada baralho, por "pasta|baralho": se embaralha a ordem e
+     quantos cartões por dia. */
+  baralhoCfg: {},
+  /* esquema da escada de revisão espaçada, escolhido em Revisões */
+  revisao: { esquema: "cadencia", dias: [7, 21, 60, 150] },
+  /* As respostas do teste de memória e a escada que saiu dele. Guardadas
+     como número, não como rótulo: é o que deixa trocar o texto de uma
+     pergunta sem invalidar o perfil de quem já respondeu. */
+  perfilMemoria: { respostas: {}, dias: [], aplicadoEm: "" },
+  /* aparência: cor de acento, fonte e tamanho do texto */
+  tema: { cor: "cadencia", neon: "", neon2: "", fonte: "inter", tamanho: 1 },
+  /* Claro e escuro da anotação, à parte do resto: "auto" segue o app. */
+  notaTema: "auto",
+};
+
+const KEY = "cadencia:v3";
+
+/* Um dia no formato do <input type="date">, ou vazio. Serve para qualquer
+   data que venha de fora e vá virar conta de dias depois. */
+const diaValido = (v) => (/^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) ? String(v) : "");
+
+/* A aba Treino na volta do disco e da nuvem.
+ *
+ * Vale a mesma regra de tudo aqui: o que não for copiado se perde. Escrito
+ * à parte porque é o único ramo com três níveis de lista dentro de lista
+ * (plano → dia → exercício), e enfiar isso no meio do normalize deixaria a
+ * função ilegível.
+ *
+ * Os tetos não são desconfiança do app, são do que vem da nuvem: um
+ * documento adulterado ou corrompido com cem mil séries travaria a aba
+ * inteira na hora de desenhar o gráfico. */
+function normalizarTreino(tr) {
+  const o = (x) => (x && typeof x === "object" && !Array.isArray(x) ? x : {});
+  const a = (x) => (Array.isArray(x) ? x : []);
+  const txt = (v, n) => String(v == null ? "" : v).trim().slice(0, n);
+  const num = (v, min, max, padrao) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= min && n <= max ? n : padrao;
+  };
+
+  const exercicio = (e) => ({
+    id: txt(o(e).id, 30) || uid(),
+    nome: txt(o(e).nome, 60),
+    grupo: txt(o(e).grupo, 20),
+    series: num(o(e).series, 1, 10, 3),
+    reps: txt(o(e).reps, 12) || "8-12",
+    descanso: num(o(e).descanso, 15, 600, 90),
+    observacao: txt(o(e).observacao, 160),
+    video: txt(o(e).video, 200),
+  });
+
+  const serieFeita = (s) => ({
+    id: txt(o(s).id, 30) || uid(),
+    exId: txt(o(s).exId, 30),
+    exNome: txt(o(s).exNome, 60),
+    grupo: txt(o(s).grupo, 20),
+    peso: num(o(s).peso, 0, 1000, 0),
+    reps: num(o(s).reps, 1, 999, 1),
+    em: num(o(s).em, 0, 4102444800000, 0),
+  });
+
+  const sessao = (s) => ({
+    id: txt(o(s).id, 30) || uid(),
+    data: txt(o(s).data, 10),
+    planoId: txt(o(s).planoId, 30),
+    diaId: txt(o(s).diaId, 30),
+    nome: txt(o(s).nome, 40),
+    inicio: num(o(s).inicio, 0, 4102444800000, 0),
+    fim: num(o(s).fim, 0, 4102444800000, 0),
+    series: a(o(s).series).slice(0, 400).map(serieFeita).filter((x) => x.exNome),
+  });
+
+  const medida = (m) => {
+    const saida = { id: txt(o(m).id, 30) || uid(), data: txt(o(m).data, 10) };
+    for (const k of ["peso", "abdome", "cintura", "quadril", "peito", "ombro",
+      "braco", "antebraco", "coxa", "panturrilha"]) {
+      const v = Number(o(m)[k]);
+      if (Number.isFinite(v) && v > 0 && v < 1000) saida[k] = v;
+    }
+    return saida;
+  };
+
+  const p = o(tr.perfil);
+  const emCurso = o(tr.emCurso);
+  return {
+    perfil: {
+      objetivo: txt(p.objetivo, 600),
+      dias: num(p.dias, 1, 7, 3),
+      nivel: txt(p.nivel, 30),
+      minutos: txt(p.minutos, 10),
+      equipamento: txt(p.equipamento, 600),
+      limitacoes: txt(p.limitacoes, 600),
+      observacoes: txt(p.observacoes, 600),
+    },
+    planos: a(tr.planos).slice(0, 20).map((pl) => ({
+      id: txt(o(pl).id, 30) || uid(),
+      nome: txt(o(pl).nome, 50) || "Meu treino",
+      aviso: txt(o(pl).aviso, 400),
+      criadoEm: num(o(pl).criadoEm, 0, 4102444800000, 0),
+      dias: a(o(pl).dias).slice(0, 7).map((d) => ({
+        id: txt(o(d).id, 30) || uid(),
+        nome: txt(o(d).nome, 40),
+        exercicios: a(o(d).exercicios).slice(0, 20).map(exercicio).filter((e) => e.nome),
+      })),
+    })),
+    planoAtivo: txt(tr.planoAtivo, 30),
+    /* O treino em andamento sobrevive a fechar o app no meio da série:
+       quem está na academia não fica com o site aberto o tempo todo. */
+    emCurso: emCurso.id ? sessao(emCurso) : null,
+    sessoes: a(tr.sessoes).slice(0, 1500).map(sessao).filter((s) => s.data),
+    medidas: a(tr.medidas).slice(0, 2000).map(medida).filter((m) => m.data),
+  };
+}
+
+function normalize(raw) {
+  const d = raw && typeof raw === "object" ? raw : {};
+  const g = d.goals || {}, p = d.pomo || {}, pr = d.profile || {};
+  const obj = (x) => (x && typeof x === "object" && !Array.isArray(x) ? x : {});
+  const arr = (x, f) => (Array.isArray(x) ? x : f);
+  const gc = obj(d.googleCal);
+  const tr = obj(d.treino);
+  const rv = obj(d.revisao), tm = obj(d.tema);
+  const hex = (v) => (/^#[0-9a-fA-F]{6}$/.test(v) ? v : "");
+
+  /* Até a reorganização do cronograma o identificador da aula era a posição
+     na lista ("m12"). Agora é fixo. Quem já usava tem o formato antigo
+     gravado, então ele é traduzido aqui, na volta do disco e da nuvem: sem
+     isto o progresso apontaria para a aula errada depois da reordenação. */
+  const traduzir = (mapa) => {
+    const fora = {};
+    for (const [k, v] of Object.entries(obj(mapa))) {
+      const novo = ID_NOVO(k);
+      if (novo) { if (!fora[novo]) fora[novo] = v; }
+      else fora[k] = v;
+    }
+    return fora;
+  };
+
+  return {
+    profile: {
+      name: typeof pr.name === "string" ? pr.name : DEFAULTS.profile.name,
+      apelido: typeof pr.apelido === "string" ? pr.apelido.slice(0, 24) : "",
+      /* Só data URL de imagem entra. Um endereço http aqui viraria uma
+         busca a um site de fora toda vez que a lista de amigos abrisse,
+         contando para quem hospedasse a imagem quem estava olhando. */
+      foto: typeof pr.foto === "string" && /^data:image\//.test(pr.foto) ? pr.foto : "",
+      examDate: typeof pr.examDate === "string" ? pr.examDate : "",
+      onboarded: pr.onboarded === undefined ? DEFAULTS.profile.onboarded : !!pr.onboarded,
+    },
+    theme: d.theme === "light" ? "light" : "dark",
+    layout: d.layout === "movel" ? "movel" : "auto",
+    sessions: arr(d.sessions, []).map((x) => (
+      x && x.subjectId && ID_NOVO(x.subjectId) ? { ...x, subjectId: ID_NOVO(x.subjectId) } : x
+    )),
+    marks: traduzir(d.marks), reviews: traduzir(d.reviews),
+    routine: arr(d.routine, []), agenda: arr(d.agenda, []), tasks: arr(d.tasks, []),
+    /* O que já foi cumprido na agenda precisa sobreviver ao recarregar a
+       página: o que não for copiado aqui se perde. */
+    blocos: obj(d.blocos),
+    /* Peso por especialidade: só número de 0 a 10 entra. */
+    pesos: (() => {
+      const fora = {};
+      for (const [k, v] of Object.entries(obj(d.pesos))) {
+        const n = Math.round(Number(v));
+        if (Number.isFinite(n) && n >= 0 && n <= 10) fora[String(k).slice(0, 60)] = n;
+      }
+      return fora;
+    })(),
+    goals: {
+      daily: Number(g.daily) > 0 ? Number(g.daily) : 120,
+      weekly: Number(g.weekly) > 0 ? Number(g.weekly) : 720,
+      questions: Number(g.questions) > 0 ? Number(g.questions) : 200,
+    },
+    pomo: {
+      focus: Number(p.focus) > 0 ? Number(p.focus) : 25,
+      short: Number(p.short) > 0 ? Number(p.short) : 5,
+      long: Number(p.long) > 0 ? Number(p.long) : 15,
+      cycle: Number(p.cycle) > 0 ? Number(p.cycle) : 4,
+      modo: p.modo === "corrido" ? "corrido" : "pomodoro",
+      autoNext: p.autoNext !== false, sound: p.sound !== false,
+      corFoco: /^#[0-9a-fA-F]{6}$/.test(p.corFoco) ? p.corFoco : "#A182E6",
+      corPausa: /^#[0-9a-fA-F]{6}$/.test(p.corPausa) ? p.corPausa : "#45C08A",
+      estilo: ["anel", "digitos", "barra", "minimalista"].indexOf(p.estilo) >= 0 ? p.estilo : "anel",
+    },
+    pomoLog: arr(d.pomoLog, []), simulados: obj(d.simulados), provas: arr(d.provas, []),
+    habits: arr(d.habits, HABITS_SEED), habitLog: obj(d.habitLog),
+    rever: arr(d.rever, []), notes: obj(d.notes),
+    mostrarDesempenho: d.mostrarDesempenho !== false,
+    notaTema: ["light", "dark"].indexOf(d.notaTema) >= 0 ? d.notaTema : "auto",
+    cronograma: {
+      nome: String(obj(d.cronograma).nome || "").slice(0, 80),
+      /* Cortado aqui, e não só na hora de enviar: um arquivo enorme colado
+         encheria o armazenamento do navegador e derrubaria o salvamento
+         inteiro, não só o assistente. */
+      texto: String(obj(d.cronograma).texto || "").slice(0, 20000),
+      /* Data solta vira vazio: o campo é um <input type="date">, então o que
+         vale é AAAA-MM-DD, e qualquer outra coisa só quebraria a conta de
+         dias mais adiante. */
+      inicio: diaValido(obj(d.cronograma).inicio),
+      fim: diaValido(obj(d.cronograma).fim),
+    },
+    /* Currículo próprio: substitui o padrão (curriculo.js) no todo ou só
+       numa área, montado pela IA a partir do que a pessoa anexou em
+       Cronograma (parte9.jsx). Mesmo formato do currículo padrão, para o
+       resto do app (Matérias, Rotina, Progresso...) não precisar saber a
+       diferença. */
+    cronogramaProprio: arr(d.cronogramaProprio, []).slice(0, 300).map((s) => (obj(s))).filter((s) => (
+      typeof s.id === "string" && s.id && typeof s.title === "string" && s.title.trim()
+      && AREA_IDS.indexOf(s.area) >= 0
+    )).map((s) => ({
+      id: String(s.id).slice(0, 60),
+      week: Number(s.week) || 0,
+      area: s.area,
+      title: String(s.title).trim().slice(0, 80),
+      esp: String(s.esp || "").trim().slice(0, 40) || String(s.title).trim().slice(0, 40),
+      bonus: arr(s.bonus, []).filter((t) => typeof t === "string" && t.trim()).slice(0, 10).map((t) => String(t).trim().slice(0, 80)),
+    })),
+    cronogramaModo: d.cronogramaModo === "substituir" ? "substituir" : "somar",
+    /* Anotação rica por matéria (parte17.jsx). O HTML passa de novo por
+       limparHtmlColado aqui — não só no colar — porque este é o ponto por
+       onde entra tudo que vem de fora: outro aparelho, a nuvem, uma cópia
+       de segurança restaurada. */
+    anotacoes: Object.entries(obj(d.anotacoes)).slice(0, 500).reduce((m, [id, v]) => {
+      const html = String(obj(v).html || "").slice(0, 60000);
+      if (!html.trim()) return m;
+      m[String(id).slice(0, 60)] = {
+        html: typeof limparHtmlColado === "function" ? limparHtmlColado(html) : html,
+        atualizadoEm: Number(obj(v).atualizadoEm) || 0,
+      };
+      return m;
+    }, {}),
+    googleCal: {
+      id: typeof gc.id === "string" ? gc.id : "",
+      ultima: Number(gc.ultima) || 0,
+      autoSync: !!gc.autoSync,
+      /* Mão dupla: manda para o Google o que muda aqui. Ligado por padrão,
+         então o que conta é a recusa explícita. */
+      autoEnviar: gc.autoEnviar !== false,
+      /* Quais grupos de evento sobem, do último envio pelo botão. */
+      opts: obj(gc.opts),
+      /* O que já subiu: id do evento → "grupo:marca do conteúdo". Sem isto
+         na volta do disco, toda abertura reenviaria a agenda inteira.
+         Filtrado porque é mapa grande e vem da nuvem: valor que não for
+         texto viraria comparação estranha lá na frente. */
+      enviados: Object.entries(obj(gc.enviados))
+        .filter(([, v]) => typeof v === "string")
+        .slice(0, 3000)
+        .reduce((m, [k, v]) => { m[k] = v; return m; }, {}),
+    },
+    treino: normalizarTreino(tr),
+    /* O estilo do cartão passa por aqui como o resto: o que não for
+       copiado se perde na volta do disco. Os valores são conferidos contra
+       a lista de opções na hora de desenhar, então aqui basta serem texto
+       curto — uma opção que não existe mais cai no padrão sozinha. */
+    /* O aviso é do aparelho, mas a escolha de querer ou não é da
+       pessoa, então acompanha a conta como o resto. */
+    lembretes: {
+      ligado: !!obj(d.lembretes).ligado,
+      /* O aviso do dia que vem do servidor, separado do aviso imediato: a
+         pessoa pode querer um e não o outro, e ligar o de servidor exige
+         assinar este aparelho — não basta o interruptor. */
+      push: {
+        ligado: !!obj(obj(d.lembretes).push).ligado,
+        hora: Math.max(0, Math.min(23, Math.round(Number(obj(obj(d.lembretes).push).hora) || 7))),
+      },
+    },
+    cartaoEstilo: (() => {
+      const ce = obj(d.cartaoEstilo);
+      const t = (v, padrao) => (typeof v === "string" && v.length <= 20 ? v : padrao);
+      return {
+        fonte: t(ce.fonte, "app"),
+        tamanho: t(ce.tamanho, "normal"),
+        fundo: t(ce.fundo, "limpo"),
+        alinhar: t(ce.alinhar, "centro"),
+        peso: t(ce.peso, "normal"),
+        altura: t(ce.altura, "normal"),
+      };
+    })(),
+    /* Os cartões precisam sobreviver ao recarregar a página: como tudo passa
+       por aqui na volta do disco e da nuvem, o que não for copiado se perde. */
+    flash: arr(d.flash, []),
+    /* Pastas de baralho ficam guardadas mesmo enquanto estão vazias, senão
+       criar uma pasta e recarregar a página apagaria a pasta. */
+    pastas: [...new Set(arr(d.pastas, [])
+      .filter((x) => typeof x === "string" && x.trim())
+      .map((x) => x.trim().slice(0, 40)))].slice(0, 60),
+    /* Cada ajuste é conferido na volta do disco: um número negativo ou um
+       texto no lugar do limite faria a fila de estudo sair vazia, e o
+       sintoma apareceria longe daqui. */
+    baralhoCfg: Object.fromEntries(
+      Object.entries(obj(d.baralhoCfg)).slice(0, 300).map(([k, v]) => {
+        const c = obj(v);
+        const limite = (x) => {
+          const n = Math.floor(Number(x));
+          return Number.isFinite(n) && n > 0 ? Math.min(n, 999) : 0;
+        };
+        return [String(k).slice(0, 90), {
+          embaralhar: c.embaralhar !== false,
+          min: limite(c.min), max: limite(c.max),
+          /* Sem esta linha a cor escolhida sumia no primeiro recarregar:
+             o que o normalizador não copia, ele apaga. */
+          cor: CORES_BARALHO.some((x) => x.id === c.cor) ? c.cor : "",
+        }];
+      })),
+    revisao: {
+      esquema: ESQUEMAS.some((e) => e.id === rv.esquema) ? rv.esquema : "cadencia",
+      dias: limparDias(rv.dias).length ? limparDias(rv.dias) : DEFAULTS.revisao.dias,
+    },
+    perfilMemoria: (() => {
+      const pm = obj(d.perfilMemoria);
+      const resp = {};
+      for (const q of PERGUNTAS_MEMORIA) {
+        const v = Number(obj(pm.respostas)[q.id]);
+        if (Number.isFinite(v) && v > 0) resp[q.id] = v;
+      }
+      return {
+        respostas: resp,
+        dias: limparDias(pm.dias),
+        aplicadoEm: typeof pm.aplicadoEm === "string" ? pm.aplicadoEm.slice(0, 10) : "",
+      };
+    })(),
+    tema: {
+      cor: CORES_TEMA.some((c) => c.id === tm.cor) || tm.cor === "propria" ? tm.cor : "cadencia",
+      /* corLegivel mantém a cor dentro de uma faixa legível nos dois temas
+         (claro e escuro), mesmo se vier de um dispositivo antigo ou de uma
+         cópia de segurança de antes dessa faixa existir. */
+      neon: hex(tm.neon) ? corLegivel(hex(tm.neon)) : "",
+      neon2: hex(tm.neon2) ? corLegivel(hex(tm.neon2)) : "",
+      fonte: FONTES.some((f) => f.id === tm.fonte) ? tm.fonte : "inter",
+      tamanho: Number(tm.tamanho) >= 0.85 && Number(tm.tamanho) <= 1.3 ? Number(tm.tamanho) : 1,
+    },
+  };
+}
+
+/* ── onde ficam as rotas /api ──────────────────────────────────────────
+ *
+ * O site e o servidor podem estar em endereços diferentes. Enquanto as
+ * páginas vêm do Firebase Hosting, quem responde /api é o Worker do
+ * Cloudflare, noutro domínio; quando o domínio apontar para o Worker, os
+ * dois passam a ser o mesmo lugar.
+ *
+ * Em vez de fixar um endereço que fica errado na primeira mudança, a
+ * primeira chamada tenta o próprio site e, se a resposta for a página em
+ * vez de dados, repete no Worker. Qual dos dois funcionou fica guardado
+ * para as chamadas seguintes irem direto.
+ *
+ * Para apontar para outro servidor sem recompilar, defina window.CADENCIA_API
+ * no topo do index.html. String vazia significa "o próprio site".
+ */
+const API_RESERVA = "https://cadenciamed.joseeduardo1616.workers.dev";
+
+function basesDeApi() {
+  const cfg = typeof window !== "undefined" ? window.CADENCIA_API : undefined;
+  if (typeof cfg === "string") return [cfg.replace(/\/+$/, "")];
+  const aqui = (typeof window !== "undefined" && window.location && window.location.origin) || "";
+  /* Servido pelo próprio Worker: não há segundo lugar para tentar. */
+  if (aqui === API_RESERVA) return [""];
+  return ["", API_RESERVA];
+}
+
+let baseQueRespondeu = null;
+
+/* Chama uma rota /api e devolve { dados } ou { erro }. */
+async function chamarApi(caminho, corpo, oQue, opcoes) {
+  const metodo = (opcoes && opcoes.metodo) || "POST";
+  const bases = baseQueRespondeu === null ? basesDeApi() : [baseQueRespondeu];
+  let ultimo = { erro: `${oQue} não respondeu.` };
+
+  for (const base of bases) {
+    let r;
+    try {
+      r = await fetch(base + caminho, metodo === "GET" ? undefined : {
+        method: metodo,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(corpo || {}),
+      });
+    } catch (e) {
+      /* Rede fora do ar, ou o navegador barrou por CORS. Nos dois casos vale
+         tentar o próximo endereço antes de desistir. */
+      ultimo = { erro: "Não consegui falar com o servidor. Verifique a conexão." };
+      continue;
+    }
+    const lido = await lerRespostaDoServidor(r, oQue);
+    /* Só troca de endereço quando não há servidor atrás deste. Um erro que
+       veio do próprio servidor (cupom inválido, sessão expirada) é resposta
+       de verdade e precisa chegar a quem perguntou. */
+    if (!lido.semServidor) {
+      baseQueRespondeu = base;
+      return lido;
+    }
+    ultimo = lido;
+  }
+  return ultimo;
+}
+
+/* Lê a resposta de uma rota /api do servidor.
+ *
+ * O caso que mais confunde: quando o site está numa hospedagem só de
+ * arquivos, /api/... não existe como rota, e a hospedagem devolve a própria
+ * página do site com status 200. O JSON.parse falha, e antes isso virava um
+ * "Não deu certo." que não dizia nada — o problema real é que falta publicar
+ * o servidor, e a pessoa ficava procurando defeito no lugar errado.
+ *
+ * O campo semServidor marca justamente esse caso, para quem chamou saber que
+ * vale a pena repetir noutro endereço em vez de mostrar o erro.
+ */
+async function lerRespostaDoServidor(r, oQue) {
+  const bruto = await r.text().catch(() => "");
+  let j = null;
+  try { j = JSON.parse(bruto); } catch (e) { /* não é JSON */ }
+
+  if (j && typeof j === "object") {
+    if (r.ok) return { dados: j };
+    return { erro: j.erro || `O servidor respondeu com erro ${r.status}.` };
+  }
+
+  /* veio HTML: quem respondeu foi a hospedagem de arquivos, não o servidor */
+  if (/^\s*<(!doctype|html)/i.test(bruto)) {
+    return {
+      semServidor: true,
+      erro: `${oQue} não está publicado neste endereço: o servidor devolveu a `
+        + "página do site em vez de dados. As rotas /api precisam ser publicadas "
+        + "junto, numa hospedagem que rode código.",
+    };
+  }
+  if (r.status === 404) {
+    return { semServidor: true, erro: `${oQue} ainda não foi publicado neste site.` };
+  }
+  return { erro: `${oQue} não respondeu (erro ${r.status}).` };
+}
+
+function subjectState(s, marks) {
+  const m = marks[s.id] || {};
+  const bonusDone = m.bonusDone && typeof m.bonusDone === "object" ? m.bonusDone : {};
+  return {
+    ...s,
+    aula: !!m.aula,
+    qts: !!m.qts,
+    cards: !!m.cards,
+    perf: Number(m.perf) || 0,
+    date: m.date === undefined ? null : m.date,
+    bonusDone,
+    bonusCount: s.bonus.filter((_, i) => bonusDone[i]).length,
+  };
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   3b · ARMAZENAMENTO LOCAL
+   Prefere a API do ambiente quando existe, cai no localStorage e, em
+   último caso, na memória, para o app nunca travar.
+   ═══════════════════════════════════════════════════════════════════ */
+
+const memoria = {};
+const temStorageDoApp = () =>
+  typeof window !== "undefined" && window.storage && typeof window.storage.set === "function";
+
+async function lerBruto(k) {
+  if (temStorageDoApp()) {
+    const r = await window.storage.get(k);
+    return r ? r.value : null;
+  }
+  if (typeof window !== "undefined" && window.localStorage) return window.localStorage.getItem(k);
+  return memoria[k] === undefined ? null : memoria[k];
+}
+async function gravarBruto(k, v) {
+  if (temStorageDoApp()) { await window.storage.set(k, v); return; }
+  if (typeof window !== "undefined" && window.localStorage) { window.localStorage.setItem(k, v); return; }
+  memoria[k] = v;
+}
+function diagnostico(e) {
+  const t = String((e && (e.name || e.code)) || "") + " " + String((e && e.message) || "");
+  if (/quota|exceed|\b22\b/i.test(t)) {
+    return "O espaço de armazenamento do navegador encheu. Baixe um backup em Configurações e apague parte do histórico.";
+  }
+  if (/security|access|denied|not allowed/i.test(t)) {
+    return "O navegador bloqueou o armazenamento nesta página. Costuma acontecer em aba anônima, ou ao abrir o arquivo direto do computador.";
+  }
+  return "Não consegui gravar os dados neste navegador.";
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   3c · VERSÕES ANTERIORES
+   Um histórico do que estava guardado, para que voltar atrás nunca
+   dependa de alguém ter tido o reflexo de baixar um backup.
+
+   Existe porque uma pessoa perdeu meses de estudo. O caminho foi este:
+   um aparelho novo subiu o próprio vazio para a conta, e todos os outros
+   baixaram esse vazio por cima do que tinham. A trava que impede isso já
+   foi posta, mas ela protege contra o erro que já conhecemos — e o
+   próximo vai ser outro. O que protege contra o próximo é ter as versões
+   anteriores guardadas.
+
+   Fica no IndexedDB, e não no localStorage, por uma razão prática: o
+   localStorage tem uns 5 MB no total e é onde os dados ativos já moram.
+   Guardar doze cópias ali encheria o espaço e derrubaria justamente a
+   gravação que interessa.
+
+   As cópias são locais, deste aparelho. Não sobem para a nuvem: são a
+   rede de proteção para quando a nuvem for a coisa errada.
+   ═══════════════════════════════════════════════════════════════════ */
+
+const BD_VERSOES = "cadencia-versoes";
+const LOJA_VERSOES = "copias";
+/* Doze cópias. A mais antiga nunca é descartada enquanto houver outra
+   para descartar no lugar dela: é ela que cobre o estrago que só foi
+   notado semanas depois, que é como esse tipo de estrago costuma ser
+   notado. */
+const MAX_VERSOES = 12;
+/* Uma cópia automática por meio dia de uso. Mais que isso enche o
+   histórico de versões iguais e empurra as antigas para fora. */
+const ESPERA_VERSAO = 12 * 60 * 60 * 1000;
+
+function abrirBDVersoes() {
+  return new Promise((ok, falha) => {
+    if (typeof window === "undefined" || !window.indexedDB) return falha(new Error("sem indexedDB"));
+    const req = window.indexedDB.open(BD_VERSOES, 1);
+    req.onupgradeneeded = () => {
+      const bd = req.result;
+      if (!bd.objectStoreNames.contains(LOJA_VERSOES)) {
+        bd.createObjectStore(LOJA_VERSOES, { keyPath: "em" });
+      }
+    };
+    req.onsuccess = () => ok(req.result);
+    req.onerror = () => falha(req.error);
+  });
+}
+
+/* O que há dentro de uma cópia, para a lista poder dizer qual vale a pena
+   sem abrir nenhuma. Sem isto, escolher entre doze datas é adivinhação. */
+function resumirDados(d) {
+  const sessoes = (d && d.sessions) || [];
+  return {
+    aulas: Object.values((d && d.marks) || {}).filter((m) => m && m.aula).length,
+    revisoes: Object.values((d && d.reviews) || {})
+      .reduce((a, r) => a + Object.keys((r && r.done) || {}).length, 0),
+    sessoes: sessoes.length,
+    horas: Math.round(sessoes.reduce((a, x) => a + (Number(x.minutes) || 0), 0) / 60),
+    questoes: sessoes.reduce((a, x) => a + (Number(x.questions) || 0), 0),
+    cartoes: ((d && d.flash) || []).length,
+  };
+}
+
+async function listarVersoes() {
+  try {
+    const bd = await abrirBDVersoes();
+    const todas = await new Promise((ok, falha) => {
+      const tx = bd.transaction(LOJA_VERSOES, "readonly");
+      const r = tx.objectStore(LOJA_VERSOES).getAll();
+      r.onsuccess = () => ok(r.result || []);
+      r.onerror = () => falha(r.error);
+    });
+    bd.close();
+    return todas.sort((a, b) => b.em - a.em);
+  } catch (e) { return []; }
+}
+
+async function apagarVersao(em) {
+  try {
+    const bd = await abrirBDVersoes();
+    await new Promise((ok) => {
+      const tx = bd.transaction(LOJA_VERSOES, "readwrite");
+      tx.objectStore(LOJA_VERSOES).delete(em);
+      tx.oncomplete = () => ok(true);
+      tx.onerror = () => ok(false);
+    });
+    bd.close();
+  } catch (e) { /* segue */ }
+}
+
+/* Guarda uma cópia do que está em mãos AGORA, antes de mexer nisso.
+ *
+ * Nunca lança: uma cópia de segurança que quebra a tela ao falhar é pior
+ * do que cópia nenhuma. O "motivo" é o que a lista mostra depois, e é ele
+ * que dá sentido à data — "antes de carregar a conta" diz muito mais do
+ * que um horário.
+ */
+async function guardarVersao(dados, motivo) {
+  if (!dados) return false;
+  try {
+    const texto = JSON.stringify(dados);
+    const resumo = resumirDados(dados);
+
+    const antigas = await listarVersoes();
+    /* Cópia automática só se a última já tiver idade, e nunca se nada
+       mudou desde ela: histórico cheio de versões iguais empurra para
+       fora justamente as diferentes. */
+    if (motivo === "automática") {
+      const ultima = antigas[0];
+      if (ultima && Date.now() - ultima.em < ESPERA_VERSAO) return false;
+      if (ultima && ultima.tamanho === texto.length
+        && JSON.stringify(ultima.resumo) === JSON.stringify(resumo)) return false;
+    }
+
+    const gravar = async () => {
+      const bd = await abrirBDVersoes();
+      await new Promise((ok, falha) => {
+        const tx = bd.transaction(LOJA_VERSOES, "readwrite");
+        tx.objectStore(LOJA_VERSOES).put({
+          em: Date.now(), motivo: String(motivo || ""), resumo,
+          tamanho: texto.length, dados: texto,
+        });
+        tx.oncomplete = () => ok(true);
+        tx.onerror = () => falha(tx.error);
+      });
+      bd.close();
+    };
+
+    try { await gravar(); } catch (e) {
+      /* Sem espaço: abre lugar jogando fora a segunda mais antiga (a mais
+         antiga fica, que é a âncora) e tenta uma vez. */
+      const sobrando = antigas.slice(0, -1);
+      if (sobrando.length) await apagarVersao(sobrando[sobrando.length - 1].em);
+      await gravar();
+    }
+
+    /* Poda: sai a segunda mais antiga, nunca a primeira. */
+    let lista = await listarVersoes();
+    while (lista.length > MAX_VERSOES) {
+      await apagarVersao(lista[lista.length - 2].em);
+      lista = await listarVersoes();
+    }
+    return true;
+  } catch (e) { return false; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   4 · PEÇAS DE INTERFACE
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* Painel técnico: fundo quase transparente, borda de fio e marcas de canto,
+   no lugar do cartão arredondado. A inclinação leve segue o cursor. */
+function Card({ children, className = "", style, flat, brilho, tilt, marca }) {
+  const ref = useRef(null);
+
+  const mover = (e) => {
+    if (!tilt || !ref.current) return;
+    const r = ref.current.getBoundingClientRect();
+    const px = (e.clientX - r.left) / r.width - 0.5;
+    const py = (e.clientY - r.top) / r.height - 0.5;
+    ref.current.style.transform =
+      `perspective(1100px) rotateX(${(-py * 2.4).toFixed(2)}deg) rotateY(${(px * 3).toFixed(2)}deg)`;
+  };
+  const sair = () => {
+    if (ref.current) ref.current.style.transform = "perspective(1100px) rotateX(0) rotateY(0)";
+  };
+
+  const canto = (pos) => (
+    <span aria-hidden="true" style={{
+      position: "absolute", width: 9, height: 9, pointerEvents: "none",
+      borderColor: T.line2, borderStyle: "solid", borderWidth: 0,
+      ...(pos === "tl" ? { top: -1, left: -1, borderTopWidth: 1, borderLeftWidth: 1 }
+        : pos === "tr" ? { top: -1, right: -1, borderTopWidth: 1, borderRightWidth: 1 }
+        : pos === "bl" ? { bottom: -1, left: -1, borderBottomWidth: 1, borderLeftWidth: 1 }
+        : { bottom: -1, right: -1, borderBottomWidth: 1, borderRightWidth: 1 }),
+    }} />
+  );
+
+  return (
+    <div ref={ref} className={`rounded-3xl vidro ${className}`}
+      onPointerMove={tilt ? mover : undefined}
+      onPointerLeave={tilt ? sair : undefined}
+      style={{
+        background: flat ? T.card2 : T.card,
+        border: `1px solid ${T.line}`,
+        backdropFilter: "blur(10px)",
+        WebkitBackdropFilter: "blur(10px)",
+        position: "relative",
+        transition: "transform .35s cubic-bezier(.2,.8,.2,1), border-color .3s",
+        ...style,
+      }}>
+      {canto("tl")}{canto("tr")}{canto("bl")}{canto("br")}
+      {marca ? (
+        <span aria-hidden="true" style={{
+          position: "absolute", top: 10, right: 14, fontFamily: F_MONO,
+          fontSize: 10, letterSpacing: "0.18em", color: T.ghost, pointerEvents: "none",
+        }}>{marca}</span>
+      ) : null}
+      {brilho ? (
+        <span aria-hidden="true" style={{
+          position: "absolute", top: -1, left: "8%", right: "8%", height: 1,
+          background: `linear-gradient(90deg, transparent, ${brilho}, transparent)`,
+          opacity: 0.9, pointerEvents: "none", boxShadow: `0 0 10px ${brilho}`,
+        }} />
+      ) : null}
+      {children}
+    </div>
+  );
+}
+
+function Label({ children, style }) {
+  return <div style={{
+    fontSize: 12, fontWeight: 600, color: T.dim,
+    letterSpacing: "0.13em", textTransform: "uppercase", ...style,
+  }}>{children}</div>;
+}
+function Mini({ children, style }) {
+  return <div style={{ fontSize: 13, fontWeight: 500, color: T.faint, ...style }}>{children}</div>;
+}
+
+/* Frase corrida. O Label é rótulo, em caixa alta e espaçado; um parágrafo
+   inteiro escrito assim fica cansativo de ler. */
+function Texto({ children, style }) {
+  return <p style={{
+    fontSize: 14.5, fontWeight: 500, color: T.dim, lineHeight: 1.65, margin: 0, ...style,
+  }}>{children}</p>;
+}
+
+/* Títulos em caixa alta e bem espaçados, como nas referências */
+/* O fio à direita vem da página de entrada, onde cada capítulo abre com
+   um risco antes do olho-de-seção. Aqui ele fecha a linha em vez de
+   abri-la: o ícone já marca o começo, e um segundo risco antes dele
+   deixaria o título com duas aberturas. */
+function H({ children, size = 20, color, icon }) {
+  return (
+    <h2 className="flex items-center gap-2.5" style={{
+      fontFamily: F_UI, fontSize: Math.max(13, size - 5), fontWeight: 700, margin: 0,
+      letterSpacing: "0.16em", textTransform: "uppercase", color: color || T.ink,
+    }}>
+      {icon ? (
+        <span className="flex items-center justify-center" style={{
+          width: 26, height: 26, borderRadius: 4, flexShrink: 0,
+          border: `1px solid ${soft(color || "var(--ink)", 40)}`,
+          background: soft(color || "var(--ink)", 10), color: color || T.ink,
+        }}>{icon}</span>
+      ) : null}
+      {children}
+      <span aria-hidden="true" className="fio-h" />
+    </h2>
+  );
+}
+
+function Num({ children, size = 34, color = T.ink, weight = 600 }) {
+  return (
+    <span style={{
+      fontFamily: F_MONO, fontSize: size, fontWeight: weight, color,
+      letterSpacing: "-0.04em", fontVariantNumeric: "tabular-nums", lineHeight: 1.05,
+    }}>{children}</span>
+  );
+}
+
+function Btn({ children, onClick, tone = "quiet", disabled, className = "", title, size = "md" }) {
+  /* O primário usa a classe .btn-neon (no estilo geral, em parte8.jsx),
+     que é a mesma gradiente do botão da página de entrada — inclusive a
+     inversão no tema claro, onde as duas cores de acento são escuras e a
+     letra quase preta ficaria sem contraste. O fundo aqui embaixo é a
+     reserva de quem não tiver a classe. */
+  const map = {
+    primary: { bg: T.ink, fg: T.bg2, bd: "transparent" },
+    quiet: { bg: T.card2, fg: T.ink, bd: T.line },
+    outline: { bg: "transparent", fg: T.dim, bd: T.line2 },
+    danger: { bg: "transparent", fg: T.bad, bd: soft("var(--bad)", 35) },
+  };
+  const t = map[tone] || map.quiet;
+  /* Botão só com ícone não tem nome nenhum para quem usa leitor de tela:
+     ouve "botão" e acabou. Quando não há texto dentro, o título vira o
+     nome — é o mesmo texto que já aparece ao parar o mouse em cima, então
+     não há um segundo lugar para manter em dia. */
+  const soIcone = !React.Children.toArray(children).some(
+    (c) => typeof c === "string" || typeof c === "number",
+  );
+  return (
+    <button type="button" title={title} aria-label={soIcone ? title : undefined}
+      onClick={onClick} disabled={disabled}
+      className={`inline-flex items-center justify-center gap-2 rounded-full ${tone === "primary" ? "btn-neon " : ""}${className}`}
+      style={{
+        /* O primário não leva cor nenhuma daqui: quem pinta é a .btn-neon.
+           Escrever "background" inline zera o background-image da classe
+           (o atalho apaga as camadas), e o botão saía branco chapado em vez
+           da gradiente; a cor da letra tem o mesmo problema, e no tema
+           claro ela precisa ser branca, coisa que só a classe sabe. */
+        ...(tone === "primary" ? {} : { background: t.bg, color: t.fg }),
+        border: `1px solid ${t.bd}`,
+        padding: size === "sm" ? "7px 14px" : "11px 19px",
+        fontFamily: F_UI, fontSize: size === "sm" ? 14 : 15, fontWeight: 600,
+        opacity: disabled ? 0.35 : 1, cursor: disabled ? "not-allowed" : "pointer",
+        transition: "opacity .15s", whiteSpace: "nowrap",
+      }}>
+      {children}
+    </button>
+  );
+}
+
+const inp = {
+  background: T.card2, border: `1px solid ${T.line}`, color: T.ink, borderRadius: 14,
+  padding: "12px 15px", fontSize: 16, fontWeight: 500, width: "100%", outline: "none", fontFamily: F_UI,
+};
+const TextInput = (p) => <input {...p} style={{ ...inp, ...(p.style || {}) }} />;
+const Area = (p) => <textarea {...p} style={{ ...inp, minHeight: 100, resize: "vertical", lineHeight: 1.55, ...(p.style || {}) }} />;
+const Select = ({ children, ...p }) => <select {...p} style={{ ...inp, ...(p.style || {}) }}>{children}</select>;
+
+function Field({ label, children }) {
+  return <label className="flex flex-col gap-2"><Label>{label}</Label>{children}</label>;
+}
+
+/* Campo numérico que aceita digitação livre: o limite só é aplicado ao
+   sair do campo, senão o primeiro dígito já seria trocado pelo mínimo. */
+function NumField({ label, value, onCommit, min = 0, max = 99999, placeholder }) {
+  const [raw, setRaw] = useState(String(value == null ? "" : value));
+  const [editing, setEditing] = useState(false);
+  useEffect(() => { if (!editing) setRaw(String(value == null ? "" : value)); }, [value, editing]);
+  const commit = () => {
+    setEditing(false);
+    const clean = raw.replace(/\D/g, "");
+    if (clean === "") { setRaw(String(value)); return; }
+    onCommit(Math.min(max, Math.max(min, Number(clean))));
+  };
+  return (
+    <Field label={label}>
+      <input type="text" inputMode="numeric" pattern="[0-9]*" value={raw} placeholder={placeholder}
+        onFocus={(e) => { setEditing(true); e.target.select(); }}
+        onChange={(e) => { setEditing(true); setRaw(e.target.value.replace(/\D/g, "")); }}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === "Enter") e.currentTarget.blur(); }}
+        style={{ ...inp, fontFamily: F_MONO }} />
+    </Field>
+  );
+}
+
+function NumBox({ label, value, onChange, placeholder }) {
+  return (
+    <Field label={label}>
+      <input type="text" inputMode="numeric" pattern="[0-9]*" value={value} placeholder={placeholder}
+        onChange={(e) => onChange(e.target.value.replace(/\D/g, ""))}
+        style={{ ...inp, fontFamily: F_MONO }} />
+    </Field>
+  );
+}
+
+function Chip({ area, small }) {
+  return (
+    <span className="inline-flex items-center rounded-full"
+      style={{
+        background: soft(aColor(area), 16), color: aColor(area),
+        fontSize: small ? 12 : 13, fontWeight: 600,
+        padding: small ? "2px 8px" : "3px 10px", whiteSpace: "nowrap",
+      }}>{aLabel(area)}</span>
+  );
+}
+
+function Track({ pct, color = T.ink, height = 6 }) {
+  const p = Math.max(0, Math.min(100, pct || 0));
+  return (
+    <div className="w-full rounded-full overflow-hidden" style={{ height, background: T.card3 }}>
+      <div style={{ width: `${p}%`, height: "100%", background: color, borderRadius: 99, transition: "width .45s cubic-bezier(.2,.8,.2,1)" }} />
+    </div>
+  );
+}
+
+/* A marca de "feito".
+ *
+ * Num aparelho de dedo o quadradinho de 20px é quase impossível de acertar,
+ * então no toque o botão cresce em volta dele: o desenho continua do mesmo
+ * tamanho, e o que aumenta é a área que responde. A classe .toque faz isso,
+ * e está no <style> do app. */
+function Tick({ on, onClick, color, size = 20, label }) {
+  return (
+    <button type="button" aria-label={label} onClick={onClick}
+      className="toque flex items-center justify-center"
+      style={{ padding: 0, background: "none", border: "none", flexShrink: 0, cursor: "pointer" }}>
+      <span className="flex items-center justify-center rounded-full"
+        style={{
+          width: size, height: size,
+          border: `1.5px solid ${on ? (color || T.ink) : T.line2}`,
+          background: on ? (color || T.ink) : "transparent", transition: "background .15s",
+        }}>
+        {on ? <Check size={size * 0.6} color="var(--bg2)" strokeWidth={3} /> : null}
+      </span>
+    </button>
+  );
+}
+
+function Blank({ title, hint, icon }) {
+  return (
+    <div className="flex flex-col items-center text-center py-14 px-6">
+      <div style={{ color: T.ghost }}>{icon}</div>
+      <div className="mt-4" style={{ fontFamily: F_SERIF, fontSize: 19, color: T.dim }}>{title}</div>
+      <div className="mt-1.5" style={{ fontSize: 14, color: T.faint, maxWidth: 340, lineHeight: 1.55 }}>{hint}</div>
+    </div>
+  );
+}
+
+function Paleta({ titulo, valor, onPick }) {
+  return (
+    <div>
+      <Label>{titulo}</Label>
+      <div className="flex flex-wrap gap-2 mt-3">
+        {CORES_TIMER.map(([nome, hex]) => {
+          const on = String(valor).toLowerCase() === hex.toLowerCase();
+          return (
+            <button key={hex} type="button" title={nome} aria-label={nome} onClick={() => onPick(hex)}
+              className="flex items-center justify-center rounded-full"
+              style={{
+                width: 34, height: 34, background: hex, cursor: "pointer",
+                border: on ? `3px solid ${T.ink}` : `1px solid ${T.line}`,
+              }}>
+              {on ? <Check size={15} color="#fff" strokeWidth={3.5} /> : null}
+            </button>
+          );
+        })}
+        <label className="flex items-center gap-2 rounded-full px-3"
+          style={{ background: T.card2, border: `1px solid ${T.line}`, height: 34, cursor: "pointer" }}>
+          <input type="color" value={valor} onChange={(e) => onPick(e.target.value)}
+            style={{ width: 20, height: 20, border: "none", background: "none", padding: 0, cursor: "pointer" }} />
+          <Mini>outra</Mini>
+        </label>
+      </div>
+    </div>
+  );
+}
+
+/* Seletor de matéria. No celular o toque tira o foco do campo e a página
+   se mexe embaixo do dedo, então a escolha é resolvida no pointerdown. */
+function SubjectPicker({ value, onChange, placeholder = "Buscar matéria" }) {
+  const [q, setQ] = useState("");
+  const [open, setOpen] = useState(false);
+  const caixa = useRef(null);
+  const ativo = useAtivo();
+  const sel = value ? ativo.byId[value] : null;
+
+  const results = useMemo(() => {
+    const t = q.trim().toLowerCase();
+    if (!t) return ativo.lista.slice(0, 8);
+    return ativo.lista.filter((s) =>
+      s.title.toLowerCase().includes(t) || s.esp.toLowerCase().includes(t)
+      || aLabel(s.area).toLowerCase().includes(t) || s.esp.toLowerCase().includes(t)
+    ).slice(0, 10);
+  }, [q, ativo]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const fora = (e) => { if (caixa.current && !caixa.current.contains(e.target)) setOpen(false); };
+    document.addEventListener("pointerdown", fora);
+    return () => document.removeEventListener("pointerdown", fora);
+  }, [open]);
+
+  const escolher = (e, id) => {
+    e.preventDefault(); e.stopPropagation();
+    onChange(id); setOpen(false); setQ("");
+  };
+
+  if (sel && !open) {
+    return (
+      <div className="flex items-center gap-2.5 rounded-2xl px-3.5 py-3" style={{ background: T.card2, border: `1px solid ${T.line}` }}>
+        <Chip area={sel.area} small />
+        <span className="flex-1 min-w-0" style={{ fontSize: 15, fontWeight: 500, color: T.ink, lineHeight: 1.35 }}>{sel.title}</span>
+        <button type="button" aria-label="Trocar matéria"
+          onPointerDown={(e) => { e.preventDefault(); onChange(null); setOpen(true); setQ(""); }}
+          className="flex items-center justify-center rounded-full"
+          style={{ width: 32, height: 32, flexShrink: 0, background: T.card3, border: "none", color: T.dim, cursor: "pointer" }}>
+          <X size={15} />
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: "relative" }} ref={caixa}>
+      <div className="flex items-center gap-2 rounded-2xl px-3.5" style={{ background: T.card2, border: `1px solid ${open ? T.line2 : T.line}` }}>
+        <Search size={15} style={{ color: T.faint, flexShrink: 0 }} />
+        <input value={q} placeholder={placeholder}
+          onChange={(e) => { setQ(e.target.value); setOpen(true); }}
+          onFocus={() => setOpen(true)}
+          style={{ ...inp, background: "transparent", border: "none", padding: "12px 0", borderRadius: 0 }} />
+        {open ? (
+          <button type="button" aria-label="Fechar lista"
+            onPointerDown={(e) => { e.preventDefault(); setOpen(false); }}
+            className="flex items-center justify-center rounded-full"
+            style={{ width: 30, height: 30, flexShrink: 0, background: T.card3, border: "none", color: T.dim, cursor: "pointer" }}>
+            <X size={14} />
+          </button>
+        ) : null}
+      </div>
+      {open ? (
+        <div className="rounded-2xl mt-1.5"
+          style={{
+            position: "absolute", zIndex: 60, left: 0, right: 0, background: T.card3,
+            boxShadow: T.shadow, maxHeight: 320, overflowY: "auto",
+            border: `1px solid ${T.line2}`, WebkitOverflowScrolling: "touch",
+          }}>
+          {results.length === 0 ? (
+            <div className="px-4 py-4" style={{ fontSize: 14.5, color: T.faint }}>Nada encontrado</div>
+          ) : results.map((s) => (
+            <button key={s.id} type="button"
+              onPointerDown={(e) => escolher(e, s.id)} onClick={(e) => escolher(e, s.id)}
+              className="w-full flex items-start gap-2.5 px-4 py-3 text-left"
+              style={{ background: "transparent", border: "none", borderBottom: `1px solid ${T.line}`, cursor: "pointer", minHeight: 52 }}>
+              <span style={{ fontFamily: F_MONO, fontSize: 12, color: T.ghost, width: 22, flexShrink: 0, marginTop: 3 }}>{pad(s.week)}</span>
+              <span style={{ width: 7, height: 7, borderRadius: 99, background: aColor(s.area), flexShrink: 0, marginTop: 7 }} />
+              <span className="flex-1 min-w-0" style={{ fontSize: 14.5, fontWeight: 500, color: T.ink, lineHeight: 1.4 }}>{s.title}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}

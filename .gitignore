@@ -1,0 +1,46 @@
+node_modules/
+package-lock.json
+
+# gerados pelo build, dá para refazer com ./montar.sh
+fonte/app.jsx
+fonte/b-limpa.js
+fonte/utils.css
+fonte/index.html
+fonte/teste.html
+fonte/_teste/
+fonte/_dump.mjs
+fonte/_capturas.mjs
+fonte/captura-*.png
+fonte/tela-*.png
+captura-*.png
+fonte/icones-embutidos.txt
+__pycache__/
+
+# derivado de publicar/, refeito por fonte/publicar.py
+cadenciamed-publicar.zip
+fonte/_leitor.mjs
+fonte/_recorte.mjs
+fonte/_curriculo.mjs
+fonte/_cores.mjs
+fonte/_pastas.mjs
+fonte/_agenda.mjs
+fonte/_nuvem.mjs
+fonte/_lotes.mjs
+fonte/_revisao.mjs
+fonte/_semana.mjs
+fonte/_ficha.mjs
+fonte/_memoria.mjs
+fonte/_cartoes.mjs
+fonte/_aula.mjs
+fonte/_treino.mjs
+
+# refeitos por material/capturar.mjs e material/gerar.mjs
+material/capturas/
+material/.fontes/
+material/*.html
+material/molduras/
+material/.moldura-tmp.html
+material/slides/
+material/envio/
+cadenciamed-capturas.zip
+fonte/_anexo.mjs
