@@ -1,0 +1,54 @@
+{
+  // Configuração do Cloudflare Workers.
+  //
+  // O site é estático e mora em publicar/. As quatro rotas de servidor ficam
+  // em worker/, e "run_worker_first" garante que só /api/... passe por elas:
+  // todo o resto é servido direto do arquivo, sem custo de invocação.
+  //
+  // "single-page-application" faz qualquer endereço desconhecido devolver o
+  // index.html, então atualizar a página numa rota inventada não dá erro.
+  "name": "cadenciamed",
+  "compatibility_date": "2026-09-08",
+  "main": "./worker/index.js",
+  "assets": {
+    "directory": "./publicar/",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  // Variáveis de texto do Worker.
+  //
+  // Elas moram AQUI e não no painel do Cloudflare porque "wrangler deploy"
+  // manda a lista inteira de bindings de uma vez: o que não está neste
+  // arquivo é apagado do Worker a cada publicação. Uma variável cadastrada
+  // só no painel sobrevive até o próximo push na main e some sem avisar —
+  // foi o que aconteceu com o GOOGLE_CLIENT_ID, e o sintoma foi a Agenda
+  // dizendo que "faltam GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET" logo
+  // depois de uma publicação em que ninguém mexeu nessas variáveis.
+  //
+  // Os SEGREDOS não entram aqui e continuam no painel: o Wrangler preserva
+  // os que já existem no Worker, e eles não podem estar no repositório.
+  // São eles: GOOGLE_CLIENT_SECRET, NOTION_CLIENT_SECRET,
+  // FIREBASE_SERVICE_ACCOUNT, GEMINI_API_KEY, ANTHROPIC_API_KEY,
+  // FIREBASE_API_KEY e WEBHOOK_SEGREDO.
+  //
+  // Um id de cliente OAuth é público por natureza — ele viaja dentro da
+  // página para abrir a janela do Google —, então escrevê-lo aqui não abre
+  // nada. O segredo da mesma credencial é que não pode sair do painel.
+  "vars": {
+    "GOOGLE_CLIENT_ID": "499777815393-h6j6pf9ce3l12t423jb0nqbspl3bgpn0.apps.googleusercontent.com"
+  },
+  // A batida dos lembretes por notificação.
+  //
+  // De hora em hora, no minuto 7. De hora em hora porque cada pessoa
+  // escolhe o horário dela e os fusos não coincidem: a batida confere quem
+  // está na hora local escolhida e ignora o resto sem custo. No minuto 7
+  // porque o minuto 0 é quando todo mundo no Cloudflare agenda, e a fila
+  // atrasa justamente ali.
+  "triggers": {
+    "crons": ["7 * * * *"]
+  },
+  "observability": {
+    "enabled": true
+  }
+}
